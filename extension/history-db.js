@@ -59,6 +59,9 @@ export async function createHistorySession(metadata) {
     url: metadata.url || "",
     tabId: metadata.tabId ?? null,
     wsUrl: metadata.wsUrl || "",
+    translationMode: metadata.translationMode || "",
+    translationProvider: metadata.translationProvider || "",
+    translationModel: metadata.translationModel || "",
     status: metadata.status || "capturing",
     lineCount: Number(metadata.lineCount) || 0,
     preview: metadata.preview || ""

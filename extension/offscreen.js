@@ -1,5 +1,7 @@
 const TARGET_SAMPLE_RATE = 16000;
 const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000, 30000];
+const SERVER_FINISH_TIMEOUT_MS = 10000;
+const FINAL_WRITE_TIMEOUT_MS = 5000;
 
 let sessionId = null;
 let targetTabId = null;
@@ -518,10 +520,10 @@ async function performStopCapture(options = {}) {
     } catch {
       // The socket may have closed between the state check and send.
     }
-    const finished = await waitForServerFinished(5000);
+    const finished = await waitForServerFinished(SERVER_FINISH_TIMEOUT_MS);
     if (finished) {
-      await waitForChain(serverMessageChain, 3000);
-      await waitForChain(backgroundWriteChain, 3000);
+      await waitForChain(serverMessageChain, FINAL_WRITE_TIMEOUT_MS);
+      await waitForChain(backgroundWriteChain, FINAL_WRITE_TIMEOUT_MS);
     } else {
       await waitForChain(serverMessageChain, 1000);
       await waitForChain(backgroundWriteChain, 1000);

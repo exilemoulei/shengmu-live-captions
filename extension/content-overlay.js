@@ -141,6 +141,9 @@
           font-weight: 500;
           letter-spacing: 0.08em;
         }
+        .translation.failed {
+          color: rgba(255, 186, 162, 0.9);
+        }
         .translation:empty,
         .source:empty { display: none; }
         .drag-handle {
@@ -424,6 +427,16 @@
 
   function latestCaption() {
     const current = runtimeState?.current || {};
+    const displayCaption = current.displayCaption;
+    if (displayCaption) {
+      return {
+        source: clean(displayCaption.source),
+        translation: clean(displayCaption.translation),
+        error: clean(displayCaption.error),
+        pending: Boolean(displayCaption.pending),
+        failed: Boolean(displayCaption.failed)
+      };
+    }
     const lines = Array.isArray(current.lines) ? current.lines : [];
     const line = [...lines].reverse().find((item) => item?.source || item?.translation);
     const bufferSource = clean(current.bufferSource);
@@ -432,11 +445,15 @@
     const translation = bufferSource
       ? bufferTranslation
       : clean(line?.translation);
+    const failed = Boolean(
+      line?.translationFailed && !bufferSource && !translation
+    );
     return {
       source,
       translation,
       error: clean(current.translationError),
-      pending: Boolean(source && !translation)
+      pending: Boolean(source && !translation && !failed),
+      failed
     };
   }
 
@@ -462,18 +479,24 @@
 
     if (settings.displayMode === "english") {
       translationElement.textContent = caption.source;
-      translationElement.classList.remove("pending");
+      translationElement.classList.remove("pending", "failed");
       sourceElement.textContent = "";
     } else if (settings.displayMode === "chinese") {
       sourceElement.textContent = "";
-      translationElement.textContent =
-        caption.translation || (caption.source ? "中文翻译生成中…" : "");
-      translationElement.classList.toggle("pending", !caption.translation);
+      translationElement.textContent = caption.translation;
+      translationElement.classList.toggle(
+        "pending",
+        !caption.translation && !caption.failed
+      );
+      translationElement.classList.toggle("failed", Boolean(caption.failed));
     } else {
       sourceElement.textContent = caption.source;
-      translationElement.textContent =
-        caption.translation || (caption.source ? "中文翻译生成中…" : "");
-      translationElement.classList.toggle("pending", !caption.translation);
+      translationElement.textContent = caption.translation;
+      translationElement.classList.toggle(
+        "pending",
+        !caption.translation && !caption.failed
+      );
+      translationElement.classList.toggle("failed", Boolean(caption.failed));
     }
 
     const errorElement = shadow.querySelector(".translation-error");

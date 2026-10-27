@@ -72,6 +72,49 @@
       </section>
 
       <details class="advanced">
+        <summary>翻译引擎</summary>
+        <div class="control-row">
+          <label for="translationMode">来源</label>
+          <select id="translationMode">
+            <option value="api">API 翻译</option>
+            <option value="server">本地服务端</option>
+          </select>
+        </div>
+        <div id="apiTranslationFields">
+          <div class="control-row">
+            <label for="translationProvider">服务商</label>
+            <select id="translationProvider">
+              <option value="deepseek">DeepSeek</option>
+              <option value="openai">OpenAI</option>
+              <option value="custom">自定义兼容 API</option>
+            </select>
+          </div>
+          <p class="field-hint">API 模式会把识别出的英文字幕和最近两条上下文发送给所选服务商。</p>
+          <label for="translationBaseUrl">API 地址</label>
+          <input id="translationBaseUrl" type="url" spellcheck="false">
+          <label for="translationModel">模型</label>
+          <input id="translationModel" type="text" spellcheck="false">
+          <label for="translationApiKey">API Key</label>
+          <input id="translationApiKey" type="password" spellcheck="false" autocomplete="off" placeholder="留空则不修改已保存的 Key">
+          <p id="translationKeyHint" class="field-hint"></p>
+          <label class="switch-row">
+            <span>
+              <strong>半句预翻译</strong>
+              <small>中文更早出现，API 用量更高</small>
+            </span>
+            <input id="translationTranslatePartial" type="checkbox">
+            <i aria-hidden="true"></i>
+          </label>
+          <div class="button-row">
+            <button id="testTranslationButton" class="outline-button" type="button">测试翻译 API</button>
+            <button id="clearTranslationKey" class="outline-button" type="button" hidden>清除 Key</button>
+          </div>
+          <div id="translationTestResult" class="service-results" hidden></div>
+        </div>
+        <p id="translationUsage" class="field-hint"></p>
+      </details>
+
+      <details class="advanced">
         <summary>连接设置</summary>
         <label for="wsUrl">ASR WebSocket</label>
         <input id="wsUrl" type="url" spellcheck="false">

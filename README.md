@@ -6,6 +6,7 @@
 
 - 仅采集当前标签页，不采集其他标签页或系统全局音频。
 - 英文 ASR + 中文翻译，支持双语、仅中文、仅英文三种显示模式。
+- 翻译引擎可选 DeepSeek（默认）、OpenAI、任意 OpenAI 兼容 API 或本地 WhisperLiveKit 服务。
 - 页面浮层支持拖动、字号调整、显示开关和暂停后保留。
 - 字幕与历史窗口支持场次列表、搜索、续看、复制文本和 SRT 导出。
 - WebSocket 断线自动重连，重连后的时间码继续累加，不会回到 `00:00`。
@@ -19,6 +20,8 @@
 
 本地模型、虚拟环境和 Chrome 需要已经安装；当前工作区的 `.research` 已包含这些依赖。
 
+> 新安装默认使用 DeepSeek API。没有 API Key 时，先在扩展控制面板的“翻译引擎”里切换到“本地服务端”，或按下面的“翻译引擎”一节填写 Key。
+
 ```powershell
 Set-Location -LiteralPath '<项目目录>'
 .\scripts\Start-Services.ps1
@@ -26,6 +29,20 @@ Set-Location -LiteralPath '<项目目录>'
 ```
 
 `Start-DevBrowser.ps1` 使用项目专用 Chrome 配置目录 `chrome-profile`，与日常 Chrome 配置隔离。首次启动可自行登录需要账号的站点。
+
+### 翻译引擎
+
+新安装默认使用 DeepSeek API 翻译。打开扩展控制面板，在“翻译引擎”中填入 DeepSeek API Key 后即可开始；Key 只保存在本机扩展存储中，不会同步，也不会发送给网页内容脚本。切换到其他服务商时，各服务商的 Key 会分别保存。Key 以明文形式存放在扩展本地存储中，依赖 Windows 账户与 Chrome 配置目录的访问控制；共用电脑上建议使用临时 Key 或本地服务端。
+
+使用 API 翻译时，推荐让本地服务只做 ASR，避免重复加载 9B 翻译模型并占用显存：
+
+```powershell
+.\scripts\Start-Services.ps1 -AsrOnly
+```
+
+从 0.3.x 升级的旧配置会保持“本地服务端”模式，不会因为缺少 API Key 而中断；需要 DeepSeek 时在“翻译引擎”中切换为“API 翻译”并填写 Key。面板里的“测试翻译 API”会发送一句测试文本验证地址、模型和 Key。为防止把旧 Key 发到新地址，修改 API 地址后需要重新填写该服务商的 Key。
+
+本地服务端模式仍然使用 `Index-Translate-9B`，适合离线或不想产生 API 费用的场景。
 
 在目标视频页按 `Ctrl+Shift+Y` 打开声幕控制面板，点击“开始实时翻译”。按 `Ctrl+Shift+U` 打开字幕与历史窗口。
 
@@ -57,7 +74,8 @@ Set-Location -LiteralPath '<项目目录>'
 - 标签页内已经混合的声音无法单独排除，例如视频中播放的广告会一并转写和翻译。
 - DRM 受保护内容是否允许 `tabCapture` 取决于浏览器和站点。
 - 首次启动需要加载 Whisper 和翻译模型，通常明显慢于后续启动。
-- 字幕延迟主要来自语音停顿、ASR、翻译和网络服务；当前实测本地链路通常为 1-3 秒。
+- 字幕延迟主要来自语音停顿、ASR、翻译和网络服务；本地链路当前实测通常为 1-3 秒，外部 API 还取决于网络和服务商响应速度。
+- API 翻译按 token 计费；开启“半句预翻译”会更早显示中文，但请求次数和费用更高。
 - 原生 `<video>` 元素自身进入全屏时，网页浮层可能不可见；可改用“声幕 - 字幕与历史”窗口查看。
 - `deliveredRatio` 表示捕获到的音频时长与墙钟时长之比，用于判断采集是否持续，不等于 WebSocket 到 ASR 的成功投递率。
 
@@ -75,5 +93,7 @@ Get-ChildItem -LiteralPath .\extension -Filter *.js |
 ```
 
 v0.3.2 使用本地 TARGET 音频完成了一次 60 秒 Chrome 端到端验证：21 条历史字幕、最终缺译 0、场次状态 `stopped`、最长字幕 5.12 秒、音频捕获比中位数 `0.99968`；字幕窗口和页面浮层均已实际截图检查。此前的 YouTube 冒烟轮次被广告内容污染，不作为最终内容验收。
+
+v0.4.0 的翻译 API 客户端由 `tests/translation-api.test.js` 使用本地 OpenAI 兼容 mock 服务覆盖：请求构造、DeepSeek thinking 关闭与 400 重试、鉴权/余额/限流/超时错误、JSON 解析、用量统计。2026-10-27 使用 0.5 发布会的 2 分钟切片做了一次真实 DeepSeek 端到端验证：Chrome + WhisperLiveKit ASR-only + DeepSeek API，31 条字幕、最终缺译 0、无 fallback、捕获比中位 `0.999976`、99 次请求 / 23,700 prompt tokens + 929 completion tokens、GPU 峰值 6,479 MiB；浮层和历史窗口截图见 `paseo/evidence/`。全量发布会因 token 成本不跑，长时稳定性和本地服务端回归留待需要时再验。
 
 服务日志写入 `logs`，Chrome 专用配置写入 `chrome-profile`，研究脚本和测试产物写入 `.research`，均不纳入版本控制。

@@ -1,0 +1,10 @@
+{
+  "testedAt": "2026-10-27T23:39:00+08:00",
+  "provider": "deepseek",
+  "requestedModel": "deepseek-chat",
+  "reportedModel": "deepseek-flash",
+  "baseUrl": "https://api.deepseek.com/v1",
+  "latencyMs": 858,
+  "translation": "大家好，欢迎来到今天的直播。",
+  "keyPrinted": false
+}

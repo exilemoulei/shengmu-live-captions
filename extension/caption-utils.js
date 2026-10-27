@@ -1,3 +1,10 @@
+import {
+  DEFAULT_TRANSLATION_MODE,
+  DEFAULT_TRANSLATION_PROVIDER,
+  DEFAULT_TRANSLATION_TIMEOUT_MS,
+  normalizeTranslationSettings
+} from "./translation-api.js";
+
 export const SETTINGS_KEY = "settings";
 export const RUNTIME_STATE_KEY = "runtimeState";
 export const HISTORY_CHANGED_KEY = "historyRevision";
@@ -9,7 +16,14 @@ export const DEFAULT_SETTINGS = Object.freeze({
   opacity: 0.86,
   overlayEnabled: true,
   openPanelOnStart: true,
-  autoScroll: true
+  autoScroll: true,
+  translationMode: DEFAULT_TRANSLATION_MODE,
+  translationProvider: DEFAULT_TRANSLATION_PROVIDER,
+  translationBaseUrl: "https://api.deepseek.com/v1",
+  translationModel: "deepseek-chat",
+  translationApiKeys: Object.freeze({}),
+  translationTranslatePartial: true,
+  translationTimeoutMs: DEFAULT_TRANSLATION_TIMEOUT_MS
 });
 
 export const EMPTY_RUNTIME_STATE = Object.freeze({
@@ -26,6 +40,7 @@ export const EMPTY_RUNTIME_STATE = Object.freeze({
   wsConnected: false,
   lineCount: 0,
   audio: null,
+  translation: null,
   current: {
     lines: [],
     bufferSource: "",
@@ -37,6 +52,28 @@ export const EMPTY_RUNTIME_STATE = Object.freeze({
 
 const DISPLAY_MODES = new Set(["bilingual", "chinese", "english"]);
 
+// Content scripts only need presentation settings. Translation/API settings
+// must come from an extension page so a page-side script cannot redirect the
+// stored API key to another endpoint.
+const TAB_ALLOWED_SETTING_KEYS = new Set([
+  "displayMode",
+  "fontSize",
+  "opacity",
+  "overlayEnabled",
+  "openPanelOnStart",
+  "autoScroll"
+]);
+
+export function sanitizeSettingsPatch(patch, { fromExtensionPage = false } = {}) {
+  const value = patch && typeof patch === "object" ? patch : {};
+  if (fromExtensionPage) return value;
+  const safe = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (TAB_ALLOWED_SETTING_KEYS.has(key)) safe[key] = entry;
+  }
+  return safe;
+}
+
 export function clamp(value, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, value));
 }
@@ -45,6 +82,7 @@ export function normalizeSettings(value = {}) {
   const displayMode = DISPLAY_MODES.has(value.displayMode)
     ? value.displayMode
     : DEFAULT_SETTINGS.displayMode;
+  const translation = normalizeTranslationSettings(value);
   return {
     ...DEFAULT_SETTINGS,
     ...value,
@@ -54,7 +92,46 @@ export function normalizeSettings(value = {}) {
     opacity: clamp(Number(value.opacity) || DEFAULT_SETTINGS.opacity, 0.25, 1),
     overlayEnabled: value.overlayEnabled !== false,
     openPanelOnStart: value.openPanelOnStart !== false,
-    autoScroll: value.autoScroll !== false
+    autoScroll: value.autoScroll !== false,
+    translationMode: translation.mode,
+    translationProvider: translation.provider,
+    translationBaseUrl: translation.baseUrl,
+    translationModel: translation.model,
+    translationApiKeys: translation.apiKeys,
+    translationTranslatePartial: translation.translatePartial,
+    translationTimeoutMs: translation.timeoutMs
+  };
+}
+
+/**
+ * 0.3.x settings predate translationMode and used the WhisperLiveKit
+ * translation server. Preserve that behavior on upgrade; a fresh install
+ * (empty object) keeps the new API/DeepSeek default.
+ */
+export function migrateLegacySettings(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const settings = normalizeSettings(source);
+  if (Object.keys(source).length > 0 && source.translationMode === undefined) {
+    settings.translationMode = "server";
+  }
+  return settings;
+}
+
+/**
+ * Settings that are safe to send to content scripts and extension views.
+ * API keys stay in the background service worker and are never broadcast.
+ */
+export function settingsForBroadcast(value = {}) {
+  const normalized = normalizeSettings(value);
+  const { translationApiKeys = {}, ...safe } = normalized;
+  return {
+    ...safe,
+    translationApiKeyConfigured: Object.fromEntries(
+      Object.keys(translationApiKeys).map((provider) => [
+        provider,
+        Boolean(translationApiKeys[provider])
+      ])
+    )
   };
 }
 
@@ -90,6 +167,47 @@ export function getTranslationText(line) {
     return cleanText(translation.text);
   }
   return "";
+}
+
+export function selectDisplayCaption(current = {}) {
+  const lines = Array.isArray(current.lines) ? current.lines : [];
+  const reversedLines = [...lines].reverse();
+  const latestLine = reversedLines.find((line) => line?.source || line?.translation);
+  const translatedLine = reversedLines.find((line) => getTranslationText(line));
+  const bufferSource = cleanText(current.bufferSource);
+  const bufferTranslation = cleanText(current.bufferTranslation);
+  const bufferIsComplete = Boolean(bufferSource && bufferTranslation);
+
+  let source = "";
+  let translation = "";
+  let lineId = null;
+  let failed = false;
+  if (bufferIsComplete) {
+    source = bufferSource;
+    translation = bufferTranslation;
+  } else if (translatedLine) {
+    lineId = translatedLine.id || null;
+    source = cleanText(translatedLine.source) || getTranslationText(translatedLine);
+    translation = getTranslationText(translatedLine);
+  } else {
+    lineId = latestLine?.id || null;
+    source = bufferSource || cleanText(latestLine?.source);
+    translation = bufferSource
+      ? bufferTranslation
+      : getTranslationText(latestLine);
+    failed = Boolean(
+      !bufferSource && latestLine?.translationFailed && !translation
+    );
+  }
+
+  return {
+    lineId,
+    source,
+    translation,
+    error: cleanText(current.translationError),
+    pending: Boolean(source && !translation && !failed),
+    failed
+  };
 }
 
 export function parseTimecode(value) {

@@ -2,9 +2,9 @@
   "manifest_version": 3,
   "name": "声幕 - 实时字幕翻译",
   "short_name": "声幕",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "minimum_chrome_version": "116",
-  "description": "捕获当前标签页的英文音频，实时生成中文字幕，并在页面浮层和历史面板中显示。",
+  "description": "捕获当前标签页的英文音频，实时生成中文字幕；支持 DeepSeek/OpenAI 等翻译 API 与本地翻译服务。",
   "permissions": [
     "activeTab",
     "downloads",

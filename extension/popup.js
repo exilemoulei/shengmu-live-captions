@@ -4,6 +4,10 @@ import {
   normalizeSettings,
   normalizeWsUrl
 } from "./caption-utils.js";
+import {
+  TRANSLATION_PROVIDERS,
+  normalizeTranslationBaseUrl
+} from "./translation-api.js";
 
 const elements = {
   tabTitle: document.querySelector("#tabTitle"),
@@ -23,6 +27,20 @@ const elements = {
   wsUrl: document.querySelector("#wsUrl"),
   probeButton: document.querySelector("#probeButton"),
   serviceResults: document.querySelector("#serviceResults"),
+  translationMode: document.querySelector("#translationMode"),
+  translationProvider: document.querySelector("#translationProvider"),
+  apiTranslationFields: document.querySelector("#apiTranslationFields"),
+  translationBaseUrl: document.querySelector("#translationBaseUrl"),
+  translationModel: document.querySelector("#translationModel"),
+  translationApiKey: document.querySelector("#translationApiKey"),
+  translationKeyHint: document.querySelector("#translationKeyHint"),
+  translationTranslatePartial: document.querySelector(
+    "#translationTranslatePartial"
+  ),
+  testTranslationButton: document.querySelector("#testTranslationButton"),
+  clearTranslationKey: document.querySelector("#clearTranslationKey"),
+  translationTestResult: document.querySelector("#translationTestResult"),
+  translationUsage: document.querySelector("#translationUsage"),
   openMonitor: document.querySelector("#openMonitor"),
   openMonitorFooter: document.querySelector("#openMonitorFooter")
 };
@@ -112,6 +130,53 @@ function render() {
   elements.overlayEnabled.checked = settings.overlayEnabled;
   elements.openPanelOnStart.checked = settings.openPanelOnStart;
   elements.wsUrl.value = settings.wsUrl;
+  renderTranslationSettings();
+}
+
+function setFieldValue(element, value) {
+  if (document.activeElement !== element) element.value = value;
+}
+
+function renderTranslationSettings() {
+  const provider =
+    TRANSLATION_PROVIDERS[settings.translationProvider] ||
+    TRANSLATION_PROVIDERS.deepseek;
+  const configured = Boolean(
+    settings.translationApiKeyConfigured?.[provider.id]
+  );
+  elements.translationMode.value = settings.translationMode;
+  elements.translationProvider.value = provider.id;
+  setFieldValue(elements.translationBaseUrl, settings.translationBaseUrl);
+  setFieldValue(elements.translationModel, settings.translationModel);
+  elements.translationTranslatePartial.checked =
+    settings.translationTranslatePartial;
+  elements.apiTranslationFields.hidden = settings.translationMode !== "api";
+  elements.translationKeyHint.textContent = configured
+    ? `${provider.label} Key 已保存在本机扩展存储中`
+    : provider.requiresApiKey
+      ? `${provider.label} 需要 API Key；以明文保存在本机扩展存储，不会同步到云端`
+      : "自定义服务可以不填 Key";
+  elements.clearTranslationKey.hidden = !configured;
+
+  const translationState = runtimeState?.translation;
+  const usage = translationState?.usage;
+  let usageText = "";
+  if (settings.translationMode === "server") {
+    usageText = "本地服务端模式：译文由 WhisperLiveKit 生成。";
+  } else if (usage?.requests > 0) {
+    const tokens =
+      (Number(usage.promptTokens) || 0) +
+      (Number(usage.completionTokens) || 0);
+    usageText =
+      `${provider.label} · ${settings.translationModel} · ` +
+      `本次 ${usage.requests} 次请求 / ${tokens} tokens`;
+  } else {
+    usageText = `${provider.label} · ${settings.translationModel || "未填模型"}`;
+  }
+  if (translationState?.error) {
+    usageText += ` · ${String(translationState.error).slice(0, 90)}`;
+  }
+  elements.translationUsage.textContent = usageText;
 }
 
 async function refresh() {
@@ -142,7 +207,29 @@ async function startCapture() {
   if (!/^https?:/i.test(activeTab.url || "")) {
     throw new Error("此页面不支持标签页音频采集，请打开直播或视频网页");
   }
-  await savePatch({ wsUrl: normalizeWsUrl(elements.wsUrl.value) });
+  // Persist visible translation fields before starting: a click blurs the key
+  // input, and the asynchronous change handler may otherwise lose the race
+  // with start-capture.
+  const patch = {
+    wsUrl: normalizeWsUrl(elements.wsUrl.value),
+    translationMode: elements.translationMode.value,
+    translationTranslatePartial: elements.translationTranslatePartial.checked
+  };
+  if (patch.translationMode === "api") {
+    const provider = elements.translationProvider.value;
+    const baseUrl = normalizeTranslationBaseUrl(
+      elements.translationBaseUrl.value
+    );
+    if (!baseUrl) throw new Error("请填写翻译 API 地址");
+    patch.translationProvider = provider;
+    patch.translationBaseUrl = baseUrl;
+    patch.translationModel = elements.translationModel.value.trim();
+    if (!patch.translationModel) throw new Error("请填写翻译模型");
+    const apiKey = elements.translationApiKey.value.trim();
+    if (apiKey) patch.translationApiKeys = { [provider]: apiKey };
+  }
+  await savePatch(patch);
+  elements.translationApiKey.value = "";
   const streamId = await chrome.tabCapture.getMediaStreamId({
     targetTabId: activeTab.id
   });
@@ -227,6 +314,117 @@ elements.wsUrl.addEventListener("change", () => {
     );
   } catch (error) {
     setError(error.message);
+  }
+});
+
+elements.translationMode.addEventListener("change", () => {
+  void savePatch({ translationMode: elements.translationMode.value }).catch(
+    (error) => setError(error.message)
+  );
+});
+
+elements.translationProvider.addEventListener("change", () => {
+  const preset =
+    TRANSLATION_PROVIDERS[elements.translationProvider.value] ||
+    TRANSLATION_PROVIDERS.deepseek;
+  elements.translationApiKey.value = "";
+  elements.translationTestResult.hidden = true;
+  void savePatch({
+    translationProvider: preset.id,
+    translationBaseUrl: preset.baseUrl,
+    translationModel: preset.model
+  }).catch((error) => setError(error.message));
+});
+
+elements.translationBaseUrl.addEventListener("change", () => {
+  try {
+    const url = normalizeTranslationBaseUrl(elements.translationBaseUrl.value);
+    if (!url) throw new Error("请填写翻译 API 地址");
+    elements.translationBaseUrl.value = url;
+    void savePatch({ translationBaseUrl: url }).catch((error) =>
+      setError(error.message)
+    );
+  } catch (error) {
+    setError(error.message);
+  }
+});
+
+elements.translationModel.addEventListener("change", () => {
+  const model = elements.translationModel.value.trim();
+  void savePatch({ translationModel: model }).catch((error) =>
+    setError(error.message)
+  );
+});
+
+elements.translationApiKey.addEventListener("change", () => {
+  const apiKey = elements.translationApiKey.value.trim();
+  if (!apiKey) return;
+  void savePatch({
+    translationApiKeys: { [elements.translationProvider.value]: apiKey }
+  })
+    .then(() => {
+      elements.translationApiKey.value = "";
+      elements.translationTestResult.hidden = true;
+    })
+    .catch((error) => setError(error.message));
+});
+
+elements.clearTranslationKey.addEventListener("click", () => {
+  void savePatch({
+    translationApiKeys: { [elements.translationProvider.value]: "" }
+  })
+    .then(() => {
+      elements.translationTestResult.hidden = true;
+    })
+    .catch((error) => setError(error.message));
+});
+
+elements.translationTranslatePartial.addEventListener("change", () => {
+  void savePatch({
+    translationTranslatePartial: elements.translationTranslatePartial.checked
+  }).catch((error) => setError(error.message));
+});
+
+elements.testTranslationButton.addEventListener("click", async () => {
+  elements.testTranslationButton.disabled = true;
+  elements.translationTestResult.hidden = false;
+  elements.translationTestResult.textContent = "正在请求翻译 API...";
+  setError();
+  try {
+    const provider = elements.translationProvider.value;
+    const baseUrl = normalizeTranslationBaseUrl(
+      elements.translationBaseUrl.value
+    );
+    if (!baseUrl) throw new Error("请填写翻译 API 地址");
+    const patch = {
+      translationMode: elements.translationMode.value,
+      translationProvider: provider,
+      translationBaseUrl: baseUrl,
+      translationModel: elements.translationModel.value.trim()
+    };
+    if (!patch.translationModel) throw new Error("请填写翻译模型");
+    const pendingKey = elements.translationApiKey.value.trim();
+    if (pendingKey) {
+      patch.translationApiKeys = { [provider]: pendingKey };
+    }
+    await savePatch(patch);
+    elements.translationApiKey.value = "";
+    const response = await chrome.runtime.sendMessage({
+      target: "background",
+      type: "test-translation-api"
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error || "翻译 API 测试失败");
+    }
+    const result = response.result;
+    elements.translationTestResult.textContent =
+      `连接成功：${result.model} · ${result.latencyMs} ms · ${result.translation}`;
+  } catch (error) {
+    elements.translationTestResult.textContent = `失败：${
+      error?.message || String(error)
+    }`;
+  } finally {
+    elements.testTranslationButton.disabled = false;
   }
 });
 

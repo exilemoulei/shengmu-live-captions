@@ -4,13 +4,29 @@ import {
   HISTORY_CHANGED_KEY,
   RUNTIME_STATE_KEY,
   SETTINGS_KEY,
+  getTranslationText,
   lineChanged,
   lineNeedsTranslation,
   mergeCaptionLines,
+  migrateLegacySettings,
   normalizeCaptionLines,
   normalizeSettings,
-  normalizeWsUrl
+  normalizeWsUrl,
+  sanitizeSettingsPatch,
+  selectDisplayCaption,
+  settingsForBroadcast
 } from "./caption-utils.js";
+import {
+  TRANSLATION_PROVIDERS,
+  isAbortError,
+  normalizeTranslationBaseUrl,
+  normalizeTranslationProvider,
+  recentTranslationContext,
+  resolveTranslationConfig,
+  testTranslationConnection,
+  translateTexts,
+  translationConfigIssue
+} from "./translation-api.js";
 import {
   countHistoryLines,
   createHistorySession,
@@ -24,6 +40,13 @@ const OFFSCREEN_URL = "offscreen.html";
 const MONITOR_URL = "subtitle.html";
 const LINE_FLUSH_DELAY_MS = 700;
 const STATE_PERSIST_DELAY_MS = 350;
+const TRANSLATION_LINE_DEBOUNCE_MS = 160;
+const TRANSLATION_LINE_BATCH_SIZE = 6;
+const TRANSLATION_LINE_MAX_ATTEMPTS = 3;
+const TRANSLATION_LINE_RETRY_DELAYS_MS = [1200, 3000];
+const TRANSLATION_BUFFER_DEBOUNCE_MS = 450;
+const TRANSLATION_BUFFER_MIN_INTERVAL_MS = 1200;
+const TRANSLATION_STOP_TIMEOUT_MS = 15000;
 
 let settingsCache = { ...DEFAULT_SETTINGS };
 let runtimeState = structuredClone(EMPTY_RUNTIME_STATE);
@@ -34,6 +57,21 @@ let finalizingPromise = null;
 let knownLineSignatures = new Map();
 let pendingStopDetail = "";
 let lastHistoryWriteError = "";
+
+let translationPending = new Map();
+let translationFailed = new Map();
+let translationFlushTimer = null;
+let translationFlushPromise = null;
+let translationRetryTimer = null;
+let translationBufferTimer = null;
+let translationBufferInFlight = false;
+let translationBufferAbort = null;
+let translationLineAbort = null;
+let translationBufferRequestedText = "";
+let translationBufferLastRequestAt = 0;
+let translationUsage = { requests: 0, promptTokens: 0, completionTokens: 0 };
+let translationLastError = "";
+let translationGeneration = 0;
 
 function safeClone(value) {
   return value == null ? value : structuredClone(value);
@@ -57,9 +95,20 @@ function initialize() {
       chrome.storage.session.get([RUNTIME_STATE_KEY])
     ]);
     try {
-      settingsCache = normalizeSettings(localValues[SETTINGS_KEY] || {});
+      settingsCache = migrateLegacySettings(localValues[SETTINGS_KEY]);
+      if (
+        localValues[SETTINGS_KEY] &&
+        localValues[SETTINGS_KEY].translationMode === undefined
+      ) {
+        await chrome.storage.local.set({ [SETTINGS_KEY]: settingsCache });
+      }
     } catch {
-      settingsCache = { ...DEFAULT_SETTINGS };
+      // Keep API keys and other valid fields if only one setting (usually the
+      // legacy wsUrl) is malformed.
+      settingsCache = normalizeSettings({
+        ...(localValues[SETTINGS_KEY] || {}),
+        wsUrl: DEFAULT_SETTINGS.wsUrl
+      });
       await chrome.storage.local.set({ [SETTINGS_KEY]: settingsCache });
     }
     if (!localValues[SETTINGS_KEY]) {
@@ -74,6 +123,15 @@ function initialize() {
           ...(sessionValues[RUNTIME_STATE_KEY].current || {})
         }
       };
+      const storedUsage = runtimeState.translation?.usage;
+      if (storedUsage) {
+        translationUsage = {
+          requests: Number(storedUsage.requests) || 0,
+          promptTokens: Number(storedUsage.promptTokens) || 0,
+          completionTokens: Number(storedUsage.completionTokens) || 0
+        };
+      }
+      translationLastError = runtimeState.translation?.error || "";
     }
     await updateBadge();
     if (runtimeState.active && !(await hasOffscreenDocument())) {
@@ -82,6 +140,12 @@ function initialize() {
         "浏览器后台采集页面已中断，请重新开始",
         { quiet: true }
       );
+    } else if (runtimeState.active && apiTranslationActive()) {
+      // The service worker can be recycled mid-session. Rebuild the pending
+      // queue from the restored runtime lines; none of the queue/timers are
+      // persisted in memory.
+      scheduleLineTranslations(0);
+      scheduleBufferTranslation();
     }
   })();
   return initializationPromise;
@@ -94,14 +158,94 @@ async function getSettings() {
 
 async function saveSettings(patch) {
   await initialize();
-  settingsCache = normalizeSettings({ ...settingsCache, ...patch });
+  const merged = { ...settingsCache, ...patch };
+  if (patch.translationProvider) {
+    // A provider switch must not inherit another provider's endpoint/model,
+    // otherwise a DeepSeek key could be sent to a stale custom URL.
+    const preset =
+      TRANSLATION_PROVIDERS[
+        normalizeTranslationProvider(patch.translationProvider)
+      ];
+    if (!("translationBaseUrl" in patch)) {
+      merged.translationBaseUrl = preset.baseUrl;
+    }
+    if (!("translationModel" in patch)) {
+      merged.translationModel = preset.model;
+    }
+  }
+  if (
+    patch.translationApiKeys &&
+    typeof patch.translationApiKeys === "object"
+  ) {
+    merged.translationApiKeys = {
+      ...settingsCache.translationApiKeys,
+      ...patch.translationApiKeys
+    };
+  }
+  if ("translationBaseUrl" in patch) {
+    // An explicit endpoint edit must not silently reuse the old key on a new
+    // host. Force the user to re-enter it unless this patch also supplies one
+    // or the URL is the provider's official preset.
+    const provider = normalizeTranslationProvider(
+      merged.translationProvider
+    );
+    const preset = TRANSLATION_PROVIDERS[provider];
+    let nextUrl = merged.translationBaseUrl;
+    try {
+      nextUrl = normalizeTranslationBaseUrl(
+        patch.translationBaseUrl,
+        merged.translationBaseUrl
+      );
+    } catch {
+      nextUrl = merged.translationBaseUrl;
+    }
+    const providedKey =
+      patch.translationApiKeys &&
+      typeof patch.translationApiKeys === "object" &&
+      provider in patch.translationApiKeys;
+    if (
+      !providedKey &&
+      nextUrl !== preset.baseUrl &&
+      settingsCache.translationBaseUrl !== nextUrl
+    ) {
+      merged.translationApiKeys = {
+        ...merged.translationApiKeys,
+        [provider]: ""
+      };
+    }
+  }
+  settingsCache = normalizeSettings(merged);
   await chrome.storage.local.set({ [SETTINGS_KEY]: settingsCache });
   await broadcastToExtension({
     type: "settings-changed",
-    settings: safeClone(settingsCache)
+    settings: settingsForBroadcast(settingsCache)
   });
+  if (translationSettingsChanged(patch)) {
+    translationFailed.clear();
+    translationLastError = "";
+    clearTimeout(translationRetryTimer);
+    translationRetryTimer = null;
+    cancelBufferTranslation();
+    translationBufferRequestedText = "";
+    if (runtimeState.active && apiTranslationActive()) {
+      scheduleLineTranslations(0);
+      scheduleBufferTranslation();
+    }
+  }
   await applyOverlaySetting();
-  return safeClone(settingsCache);
+  return settingsForBroadcast(settingsCache);
+}
+
+function translationSettingsChanged(patch = {}) {
+  return [
+    "translationMode",
+    "translationProvider",
+    "translationBaseUrl",
+    "translationModel",
+    "translationApiKeys",
+    "translationTranslatePartial",
+    "translationTimeoutMs"
+  ].some((key) => key in patch);
 }
 
 async function persistRuntimeState(immediate = false) {
@@ -174,7 +318,7 @@ async function broadcastCaptionState() {
       updatedAt: runtimeState.updatedAt,
       current: safeClone(runtimeState.current)
     },
-    settings: safeClone(settingsCache)
+    settings: settingsForBroadcast(settingsCache)
   });
 }
 
@@ -223,7 +367,7 @@ async function injectOverlay(tabId = runtimeState.tabId) {
     await chrome.tabs.sendMessage(tabId, {
       target: "content",
       type: "init",
-      settings: safeClone(settingsCache),
+      settings: settingsForBroadcast(settingsCache),
       state: compactRuntimeState()
     });
   } catch {
@@ -370,6 +514,557 @@ async function summarizeHistorySession(sessionId) {
   };
 }
 
+function compactText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function translationConfig() {
+  return resolveTranslationConfig(settingsCache);
+}
+
+function apiTranslationActive() {
+  return translationConfig().enabled;
+}
+
+function refreshTranslationSummary() {
+  const config = translationConfig();
+  runtimeState.translation = {
+    mode: config.mode,
+    provider: config.provider,
+    providerLabel: config.providerLabel,
+    model: config.model,
+    enabled: config.enabled,
+    usage: { ...translationUsage },
+    error: translationLastError
+  };
+}
+
+function abortLineTranslation() {
+  if (!translationLineAbort) return;
+  try {
+    translationLineAbort.abort();
+  } catch {
+    // Ignore abort races.
+  }
+  translationLineAbort = null;
+}
+
+function resetTranslationMemory({ keepUsage = false } = {}) {
+  translationGeneration += 1;
+  clearTimeout(translationFlushTimer);
+  clearTimeout(translationRetryTimer);
+  translationFlushTimer = null;
+  translationRetryTimer = null;
+  translationFlushPromise = null;
+  abortLineTranslation();
+  translationPending.clear();
+  translationFailed.clear();
+  translationLastError = "";
+  cancelBufferTranslation();
+  translationBufferRequestedText = "";
+  translationBufferLastRequestAt = 0;
+  if (!keepUsage) {
+    translationUsage = { requests: 0, promptTokens: 0, completionTokens: 0 };
+  }
+  refreshTranslationSummary();
+}
+
+function addTranslationUsage(usage) {
+  translationUsage.requests += 1;
+  translationUsage.promptTokens += Number(usage?.promptTokens) || 0;
+  translationUsage.completionTokens += Number(usage?.completionTokens) || 0;
+}
+
+function shouldRetryTranslationError(error) {
+  return ![
+    "auth",
+    "balance",
+    "config",
+    "bad_request",
+    "thinking_only",
+    "empty_translation",
+    "truncated"
+  ].includes(error?.code);
+}
+
+function updateRuntimeLine(lineId, patch) {
+  const lines = runtimeState.current?.lines || [];
+  const line = lines.find((item) => item?.id === lineId);
+  if (line) Object.assign(line, patch);
+  const epochLine = currentEpochLines.find((item) => item?.id === lineId);
+  if (epochLine) Object.assign(epochLine, patch);
+  return line || null;
+}
+
+function markLineTranslationFailed(lineId) {
+  const patch = { translationPending: false, translationFailed: true };
+  const line =
+    updateRuntimeLine(lineId, patch) || knownLineSignatures.get(lineId);
+  if (!line) return;
+  const updated = { ...line, ...patch };
+  knownLineSignatures.set(lineId, updated);
+  historyWriteQueue.enqueue([updated]);
+}
+
+async function broadcastCaptionUpdate() {
+  if (!runtimeState.current) return;
+  if (translationConfig().mode === "api") {
+    runtimeState.current.translationError = translationLastError;
+  }
+  runtimeState.current.displayCaption = selectDisplayCaption(
+    runtimeState.current
+  );
+  refreshTranslationSummary();
+  await persistRuntimeState();
+  await broadcastToExtension({
+    type: "caption-state",
+    current: safeClone(runtimeState.current),
+    lineCount: runtimeState.lineCount
+  });
+  await broadcastCaptionState();
+  await flushPendingHistory(false);
+}
+
+async function applyLineTranslations(entries, translations, fallback = false) {
+  const generation = translationGeneration;
+  const applied = [];
+  const emptyEntries = [];
+  let sourceChanged = false;
+  for (let index = 0; index < entries.length; index += 1) {
+    if (generation !== translationGeneration) {
+      return { applied: 0, sourceChanged, emptyEntries };
+    }
+    const [lineId, entry] = entries[index];
+    const runtimeLine = (runtimeState.current?.lines || []).find(
+      (item) => item?.id === lineId
+    );
+    // A slow response may arrive after the line fell out of the 120-line
+    // runtime window. Keep translating it into history from the last known
+    // copy instead of silently losing a final subtitle.
+    const line = runtimeLine || knownLineSignatures.get(lineId);
+    if (!line || line.source !== entry.source) {
+      const pending = translationPending.get(lineId);
+      if (pending && line?.source) {
+        pending.source = line.source;
+        pending.attempts = 0;
+        pending.fallback = compactText(line.fallbackTranslation);
+        sourceChanged = true;
+      } else {
+        translationPending.delete(lineId);
+      }
+      continue;
+    }
+    const text = compactText(translations[index]);
+    if (!text) {
+      // The model returned an empty slot. Count it so one untranslatable
+      // marker cannot be retried forever and starve later lines.
+      emptyEntries.push([lineId, entry]);
+      continue;
+    }
+    const patch = {
+      translation: text,
+      translationPending: false,
+      translationFailed: false,
+      translationFallback: fallback
+    };
+    if (runtimeLine) updateRuntimeLine(lineId, patch);
+    const updated = {
+      ...line,
+      ...patch,
+      signature: `${line.source}\u0000${text}`
+    };
+    knownLineSignatures.set(lineId, updated);
+    historyWriteQueue.enqueue([updated]);
+    translationPending.delete(lineId);
+    applied.push(updated);
+  }
+  if (applied.length > 0) await broadcastCaptionUpdate();
+  return { applied: applied.length, sourceChanged, emptyEntries };
+}
+
+async function applyPendingFallbacks() {
+  const fallbacks = [];
+  for (const [lineId, entry] of [...translationPending.entries()]) {
+    if (entry.fallback) {
+      fallbacks.push([lineId, entry]);
+    } else {
+      translationPending.delete(lineId);
+      translationFailed.set(lineId, entry.source);
+      markLineTranslationFailed(lineId);
+    }
+  }
+  if (fallbacks.length > 0) {
+    await applyLineTranslations(
+      fallbacks,
+      fallbacks.map(([, entry]) => entry.fallback),
+      true
+    );
+  }
+}
+
+function collectPendingLineTranslations() {
+  if (!apiTranslationActive()) return;
+  const lines = runtimeState.current?.lines || [];
+  for (const line of lines) {
+    if (!line?.id || !line.source || line.translation) continue;
+    if (translationFailed.get(line.id) === line.source) continue;
+    const existing = translationPending.get(line.id);
+    if (existing) {
+      if (existing.source !== line.source) {
+        existing.source = line.source;
+        existing.attempts = 0;
+      }
+      existing.fallback =
+        compactText(line.fallbackTranslation) || existing.fallback;
+      continue;
+    }
+    translationPending.set(line.id, {
+      source: line.source,
+      attempts: 0,
+      fallback: compactText(line.fallbackTranslation)
+    });
+  }
+}
+
+function scheduleLineTranslations(delay = TRANSLATION_LINE_DEBOUNCE_MS) {
+  if (!apiTranslationActive() || !runtimeState.active) return;
+  collectPendingLineTranslations();
+  if (translationPending.size === 0) return;
+  if (translationRetryTimer) return;
+  if (translationFlushTimer || translationFlushPromise) return;
+  translationFlushTimer = setTimeout(() => {
+    translationFlushTimer = null;
+    void flushLineTranslations();
+  }, Math.max(0, delay));
+}
+
+async function handleTranslationFailure(entries, error) {
+  const generation = translationGeneration;
+  const message = compactText(error?.message || error);
+  translationLastError = message;
+  const retryable = shouldRetryTranslationError(error);
+  const fallbacks = [];
+  let nextRetryAttempts = Infinity;
+  for (const [lineId, entry] of entries) {
+    if (generation !== translationGeneration) return;
+    entry.attempts += 1;
+    if (!retryable || entry.attempts >= TRANSLATION_LINE_MAX_ATTEMPTS) {
+      if (entry.fallback) {
+        fallbacks.push([lineId, entry]);
+      } else {
+        translationFailed.set(lineId, entry.source);
+        markLineTranslationFailed(lineId);
+      }
+      translationPending.delete(lineId);
+    } else {
+      nextRetryAttempts = Math.min(nextRetryAttempts, entry.attempts);
+    }
+  }
+  if (fallbacks.length > 0) {
+    await applyLineTranslations(
+      fallbacks,
+      fallbacks.map(([, entry]) => entry.fallback),
+      true
+    );
+  } else {
+    await broadcastCaptionUpdate();
+  }
+  if (
+    retryable &&
+    Number.isFinite(nextRetryAttempts) &&
+    runtimeState.active &&
+    generation === translationGeneration
+  ) {
+    const delay =
+      TRANSLATION_LINE_RETRY_DELAYS_MS[
+        Math.min(nextRetryAttempts - 1, TRANSLATION_LINE_RETRY_DELAYS_MS.length - 1)
+      ];
+    clearTimeout(translationRetryTimer);
+    translationRetryTimer = setTimeout(() => {
+      translationRetryTimer = null;
+      scheduleLineTranslations(0);
+    }, delay);
+  }
+}
+
+async function flushLineTranslations() {
+  if (translationFlushPromise) return translationFlushPromise;
+  const generation = translationGeneration;
+  const promise = (async () => {
+    for (let round = 0; round < 12; round += 1) {
+      if (
+        !runtimeState.active ||
+        generation !== translationGeneration ||
+        !apiTranslationActive()
+      ) {
+        return;
+      }
+      collectPendingLineTranslations();
+      if (translationPending.size === 0) return;
+      const entries = [...translationPending.entries()].slice(
+        0,
+        TRANSLATION_LINE_BATCH_SIZE
+      );
+      const config = translationConfig();
+      if (!config.enabled) {
+        const error = new Error(config.issue || "翻译 API 未启用");
+        error.code = "config";
+        await handleTranslationFailure(entries, error);
+        return;
+      }
+      let result;
+      const controller = new AbortController();
+      translationLineAbort = controller;
+      try {
+        result = await translateTexts({
+          texts: entries.map(([, entry]) => entry.source),
+          context: recentTranslationContext(runtimeState.current?.lines || []),
+          config,
+          signal: controller.signal
+        });
+      } catch (error) {
+        if (isAbortError(error)) return;
+        await handleTranslationFailure(entries, error);
+        return;
+      } finally {
+        if (translationLineAbort === controller) {
+          translationLineAbort = null;
+        }
+      }
+      if (generation !== translationGeneration) return;
+      translationLastError = "";
+      addTranslationUsage(result.usage);
+      const outcome = await applyLineTranslations(
+        entries,
+        result.translations
+      );
+      if (outcome.emptyEntries.length > 0) {
+        const error = new Error("翻译 API 返回了空译文");
+        error.code = "empty_translation";
+        await handleTranslationFailure(outcome.emptyEntries, error);
+        if (
+          translationPending.size > 0 &&
+          runtimeState.active &&
+          !translationRetryTimer
+        ) {
+          scheduleLineTranslations(250);
+        }
+        return;
+      }
+      if (outcome.applied === 0) {
+        if (outcome.sourceChanged) {
+          // The ASR row grew while the request was in flight. Retranslate the
+          // newest source on the next loop instead of counting it as missing.
+          continue;
+        }
+        const error = new Error("翻译 API 没有返回对应译文");
+        error.code = "empty_translation";
+        await handleTranslationFailure(entries, error);
+        return;
+      }
+    }
+  })();
+  translationFlushPromise = promise;
+  try {
+    await promise;
+  } finally {
+    if (translationFlushPromise === promise) translationFlushPromise = null;
+    if (
+      translationPending.size > 0 &&
+      runtimeState.active &&
+      !translationRetryTimer &&
+      generation === translationGeneration
+    ) {
+      scheduleLineTranslations(250);
+    }
+  }
+  return promise;
+}
+
+function cancelBufferTranslation() {
+  clearTimeout(translationBufferTimer);
+  translationBufferTimer = null;
+  if (translationBufferAbort) {
+    try {
+      translationBufferAbort.abort();
+    } catch {
+      // Ignore abort races.
+    }
+    translationBufferAbort = null;
+  }
+  translationBufferInFlight = false;
+}
+
+function scheduleBufferTranslation() {
+  if (
+    !apiTranslationActive() ||
+    !settingsCache.translationTranslatePartial ||
+    !runtimeState.active
+  ) {
+    return;
+  }
+  const text = compactText(runtimeState.current?.bufferSource);
+  if (!text) {
+    cancelBufferTranslation();
+    translationBufferRequestedText = "";
+    return;
+  }
+  if (text === translationBufferRequestedText) return;
+  // Do not restart the debounce on every partial update: live buffers change
+  // several times per second, and a reset-on-change timer would never fire.
+  if (translationBufferTimer) return;
+  const wait = Math.max(
+    TRANSLATION_BUFFER_DEBOUNCE_MS,
+    translationBufferLastRequestAt + TRANSLATION_BUFFER_MIN_INTERVAL_MS - Date.now()
+  );
+  translationBufferTimer = setTimeout(() => {
+    translationBufferTimer = null;
+    void flushBufferTranslation();
+  }, wait);
+}
+
+async function flushBufferTranslation() {
+  const generation = translationGeneration;
+  if (
+    !runtimeState.active ||
+    generation !== translationGeneration ||
+    !apiTranslationActive()
+  ) {
+    return;
+  }
+  const text = compactText(runtimeState.current?.bufferSource);
+  if (!text) return;
+  if (translationPending.size > 0 || translationFlushPromise) {
+    translationBufferTimer = setTimeout(() => {
+      translationBufferTimer = null;
+      void flushBufferTranslation();
+    }, 300);
+    return;
+  }
+  if (translationBufferInFlight) {
+    translationBufferTimer = setTimeout(() => {
+      translationBufferTimer = null;
+      void flushBufferTranslation();
+    }, 300);
+    return;
+  }
+  if (text === translationBufferRequestedText) return;
+  const config = translationConfig();
+  if (!config.enabled) return;
+
+  translationBufferInFlight = true;
+  translationBufferRequestedText = text;
+  translationBufferLastRequestAt = Date.now();
+  const controller = new AbortController();
+  translationBufferAbort = controller;
+  try {
+    const result = await translateTexts({
+      texts: [text],
+      context: recentTranslationContext(runtimeState.current?.lines || []),
+      config,
+      partial: true,
+      signal: controller.signal
+    });
+    if (generation !== translationGeneration || !runtimeState.active) return;
+    addTranslationUsage(result.usage);
+    translationLastError = "";
+    if (compactText(runtimeState.current?.bufferSource) === text) {
+      runtimeState.current.bufferTranslation = compactText(
+        result.translations[0]
+      );
+      await broadcastCaptionUpdate();
+    }
+  } catch (error) {
+    if (generation !== translationGeneration || isAbortError(error)) return;
+    translationLastError = compactText(error?.message || error);
+    if (shouldRetryTranslationError(error)) {
+      translationBufferRequestedText = "";
+    } else {
+      // A bad key or balance problem will not fix itself for this text.
+      translationBufferRequestedText = text;
+      await broadcastCaptionUpdate();
+    }
+  } finally {
+    if (generation === translationGeneration) {
+      translationBufferInFlight = false;
+      translationBufferAbort = null;
+      if (runtimeState.active) {
+        const currentText = compactText(runtimeState.current?.bufferSource);
+        if (currentText && currentText !== text) {
+          scheduleBufferTranslation();
+        } else if (
+          currentText &&
+          currentText === text &&
+          !translationBufferRequestedText
+        ) {
+          scheduleBufferTranslation();
+        }
+      }
+    }
+  }
+}
+
+async function settleTranslations(timeoutMs = TRANSLATION_STOP_TIMEOUT_MS) {
+  if (!apiTranslationActive()) {
+    await applyPendingFallbacks();
+    return;
+  }
+  cancelBufferTranslation();
+  const generation = translationGeneration;
+  const deadline = Date.now() + timeoutMs;
+  collectPendingLineTranslations();
+  while (
+    Date.now() < deadline &&
+    generation === translationGeneration &&
+    apiTranslationActive()
+  ) {
+    collectPendingLineTranslations();
+    if (translationPending.size === 0 && !translationFlushPromise) break;
+    const remaining = Math.max(0, deadline - Date.now());
+    await Promise.race([
+      translationFlushPromise || flushLineTranslations(),
+      new Promise((resolve) =>
+        setTimeout(resolve, Math.min(remaining, 600))
+      )
+    ]);
+    if (translationPending.size === 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  const inFlight = translationFlushPromise;
+  if (inFlight) {
+    await Promise.race([
+      inFlight,
+      new Promise((resolve) => setTimeout(resolve, 1200))
+    ]);
+  }
+  if (translationFlushPromise) {
+    // Abort a request that outlived the stop deadline; otherwise it could
+    // finish after the summary and be discarded.
+    abortLineTranslation();
+    await Promise.race([
+      translationFlushPromise,
+      new Promise((resolve) => setTimeout(resolve, 500))
+    ]);
+  }
+  if (generation === translationGeneration) await applyPendingFallbacks();
+}
+
+async function testTranslationApi() {
+  const config = translationConfig();
+  if (config.mode !== "api") {
+    throw new Error("当前翻译引擎是本地服务端，不需要测试 API");
+  }
+  const issue = translationConfigIssue(config);
+  if (issue) throw new Error(issue);
+  const result = await testTranslationConnection(config);
+  return {
+    ok: true,
+    translation: result.translation,
+    model: result.model,
+    latencyMs: result.latencyMs
+  };
+}
+
 async function resetSessionMemory() {
   currentEpochLines = [];
   knownLineSignatures.clear();
@@ -390,6 +1085,27 @@ async function startSession(message) {
   settingsCache = normalizeSettings({ ...settingsCache, wsUrl });
   await chrome.storage.local.set({ [SETTINGS_KEY]: settingsCache });
 
+  const translation = translationConfig();
+  if (translation.mode === "api") {
+    const issue = translationConfigIssue(translation);
+    if (issue) {
+      throw new Error(
+        `${issue}。请在扩展控制面板的“翻译引擎”中完成配置，或切换为本地服务端。`
+      );
+    }
+  } else {
+    try {
+      const response = await fetch("http://127.0.0.1:8013/health", {
+        signal: AbortSignal.timeout(1600)
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    } catch {
+      throw new Error(
+        "本地服务端翻译不可用（127.0.0.1:8013）。如果只想跑 ASR，请把翻译引擎切换为 API。"
+      );
+    }
+  }
+
   const sessionId = crypto.randomUUID();
   const startedAt = Date.now();
   const metadata = {
@@ -399,11 +1115,15 @@ async function startSession(message) {
     url: message.tabUrl || "",
     tabId: message.targetTabId ?? null,
     wsUrl,
+    translationMode: translation.mode,
+    translationProvider: translation.mode === "api" ? translation.provider : "",
+    translationModel: translation.mode === "api" ? translation.model : "",
     status: "starting",
     lineCount: 0,
     preview: ""
   };
   await resetSessionMemory();
+  resetTranslationMemory();
   await createHistorySession(metadata);
   pendingStopDetail = "";
 
@@ -420,6 +1140,7 @@ async function startSession(message) {
     updatedAt: startedAt,
     current: structuredClone(EMPTY_RUNTIME_STATE.current)
   };
+  refreshTranslationSummary();
   await persistRuntimeState(true);
   await updateBadge();
   await broadcastToExtension({
@@ -478,6 +1199,12 @@ async function finalizeSession(status, detail, options = {}) {
 
     try {
       try {
+        await settleTranslations(
+          finalStatus === "error" ? 2500 : TRANSLATION_STOP_TIMEOUT_MS
+        );
+        // Invalidate any request that outlived the stop deadline so it cannot
+        // write history after the final flush/summary.
+        translationGeneration += 1;
         await flushPendingHistory(true);
       } catch (error) {
         finalStatus = "error";
@@ -530,6 +1257,7 @@ async function finalizeSession(status, detail, options = {}) {
         await broadcastCaptionState();
       }
       if (sessionId) await notifyHistoryChanged(sessionId);
+      resetTranslationMemory({ keepUsage: true });
       pendingStopDetail = "";
     }
   })();
@@ -638,20 +1366,47 @@ async function handleTranscriptUpdate(message) {
     sessionStartedAt: runtimeState.startedAt,
     updatedAt
   });
-  currentEpochLines = normalized.lines;
+  const apiConfig = translationConfig();
+  const useApi = apiConfig.mode === "api" && apiConfig.enabled;
+  const previousLines = new Map(
+    (runtimeState.current?.lines || []).map((line) => [line.id, line])
+  );
+  const lines = normalized.lines.map((rawLine) => {
+    const previous =
+      previousLines.get(rawLine.id) || knownLineSignatures.get(rawLine.id);
+    const serverTranslation = getTranslationText(rawLine);
+    let translation = useApi ? "" : rawLine.translation;
+    let fallbackTranslation = useApi ? serverTranslation : "";
+    if (
+      !translation &&
+      previous?.translation &&
+      previous.source === rawLine.source
+    ) {
+      translation = previous.translation;
+    }
+    if (
+      !fallbackTranslation &&
+      previous?.fallbackTranslation &&
+      previous.source === rawLine.source
+    ) {
+      fallbackTranslation = previous.fallbackTranslation;
+    }
+    return {
+      ...rawLine,
+      translation,
+      fallbackTranslation,
+      translationPending: Boolean(rawLine.source && !translation),
+      translationFailed: Boolean(
+        !translation &&
+        previous?.source === rawLine.source &&
+        previous?.translationFailed
+      )
+    };
+  });
+  currentEpochLines = lines;
 
-  for (const rawLine of normalized.lines) {
-    const previous = knownLineSignatures.get(rawLine.id);
-    const line =
-      previous?.source === rawLine.source &&
-      previous.translation &&
-      !rawLine.translation
-        ? {
-            ...rawLine,
-            translation: previous.translation,
-            translationPending: false
-          }
-        : rawLine;
+  for (const line of lines) {
+    const previous = knownLineSignatures.get(line.id);
     const signature = `${line.source}\u0000${line.translation}`;
     if (lineChanged(previous, line) || previous?.signature !== signature) {
       historyWriteQueue.enqueue([line]);
@@ -663,13 +1418,40 @@ async function handleTranscriptUpdate(message) {
     runtimeState.status === "reconnecting" ? "capturing" : runtimeState.status;
   runtimeState.wsConnected = true;
   runtimeState.updatedAt = updatedAt;
-  runtimeState.current = {
-    lines: mergeCaptionLines([], normalized.lines, 120),
+  const previousBufferSource = compactText(runtimeState.current?.bufferSource);
+  const bufferChanged = previousBufferSource !== normalized.bufferSource;
+  const bufferTranslation = useApi
+    ? bufferChanged
+      ? ""
+      : compactText(runtimeState.current?.bufferTranslation)
+    : normalized.bufferTranslation;
+  const currentCaption = {
+    lines: mergeCaptionLines([], lines, 120),
     bufferSource: normalized.bufferSource,
-    bufferTranslation: normalized.bufferTranslation,
-    translationError: normalized.translationError,
+    bufferTranslation,
+    translationError: useApi
+      ? translationLastError
+      : normalized.translationError,
     epochId: message.epochId || null
   };
+  runtimeState.current = {
+    ...currentCaption,
+    displayCaption: selectDisplayCaption(currentCaption)
+  };
+  refreshTranslationSummary();
+
+  if (useApi && bufferChanged && translationBufferAbort) {
+    // Abort a stale half-sentence request, but keep the debounce timer: live
+    // buffers change several times per second and must not reset it forever.
+    try {
+      translationBufferAbort.abort();
+    } catch {
+      // Ignore abort races.
+    }
+    translationBufferAbort = null;
+    translationBufferInFlight = false;
+    translationBufferRequestedText = "";
+  }
 
   await persistRuntimeState();
   await broadcastToExtension({
@@ -680,6 +1462,11 @@ async function handleTranscriptUpdate(message) {
   });
   await broadcastCaptionState();
   await flushPendingHistory(false);
+
+  if (useApi) {
+    scheduleLineTranslations();
+    scheduleBufferTranslation();
+  }
 }
 
 async function handleAudioStats(message) {
@@ -695,6 +1482,7 @@ async function handleAudioStats(message) {
 
 async function probeServices() {
   const settings = await getSettings();
+  const translation = resolveTranslationConfig(settings);
   let wsHost = "127.0.0.1";
   let wsPort = "8010";
   let healthProtocol = "http:";
@@ -706,31 +1494,53 @@ async function probeServices() {
   } catch {
     // Keep local defaults; settings validation normally prevents this path.
   }
-  const requests = [
-    fetch(`${healthProtocol}//${wsHost}:${wsPort}/health`, {
+  const services = [];
+  try {
+    const response = await fetch(`${healthProtocol}//${wsHost}:${wsPort}/health`, {
       signal: AbortSignal.timeout(1600)
-    }).then(async (response) => ({
+    });
+    services.push({
       key: "asr",
       ok: response.ok,
       detail: response.ok ? "ASR 服务在线" : `HTTP ${response.status}`
-    })),
-    fetch("http://127.0.0.1:8013/health", {
-      signal: AbortSignal.timeout(1600)
-    }).then(async (response) => ({
+    });
+  } catch {
+    services.push({ key: "asr", ok: false, detail: "未连接" });
+  }
+
+  if (translation.mode === "server") {
+    try {
+      const response = await fetch("http://127.0.0.1:8013/health", {
+        signal: AbortSignal.timeout(1600)
+      });
+      services.push({
+        key: "translation",
+        ok: response.ok,
+        detail: response.ok ? "本地翻译服务在线" : `HTTP ${response.status}`
+      });
+    } catch {
+      services.push({ key: "translation", ok: false, detail: "未连接" });
+    }
+  } else {
+    services.push({
       key: "translation",
-      ok: response.ok,
-      detail: response.ok ? "翻译服务在线" : `HTTP ${response.status}`
-    }))
-  ];
-  const results = await Promise.allSettled(requests);
-  return results.map((result, index) => {
-    if (result.status === "fulfilled") return result.value;
-    return {
-      key: index === 0 ? "asr" : "translation",
-      ok: false,
-      detail: "未连接"
-    };
-  });
+      ok: Boolean(translation.enabled),
+      detail: translation.enabled
+        ? `${translation.providerLabel} 已配置（点“测试翻译 API”验证）`
+        : translation.issue || "尚未配置翻译 API"
+    });
+  }
+  return services;
+}
+
+function isExtensionPageSender(sender) {
+  const url = String(sender?.url || "");
+  if (url) return url.startsWith(chrome.runtime.getURL(""));
+  return sender?.id === chrome.runtime.id && !sender?.tab;
+}
+
+function rejectNonExtensionSender(sendResponse) {
+  sendResponse({ ok: false, error: "此操作只能从声幕扩展界面发起" });
 }
 
 chrome.runtime.onInstalled.addListener((details) => {
@@ -749,7 +1559,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   void (async () => {
     try {
       await initialize();
-      const fromOffscreen = message?.source === "offscreen";
+      const fromOffscreen =
+        message?.source === "offscreen" &&
+        String(sender?.url || "").startsWith(
+          chrome.runtime.getURL(OFFSCREEN_URL)
+        );
       const toBackground = message?.target === "background";
       const toContent = message?.target === "content";
 
@@ -776,22 +1590,50 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (message.type === "start-capture") {
+        if (!isExtensionPageSender(sender)) {
+          rejectNonExtensionSender(sendResponse);
+          return;
+        }
         sendResponse(await startSession(message));
       } else if (message.type === "stop-capture") {
+        if (!isExtensionPageSender(sender)) {
+          rejectNonExtensionSender(sendResponse);
+          return;
+        }
         sendResponse(await stopSession());
       } else if (message.type === "get-state") {
         sendResponse({
           ok: true,
           state: compactRuntimeState(),
-          settings: safeClone(settingsCache)
+          settings: settingsForBroadcast(settingsCache)
         });
       } else if (message.type === "get-settings") {
-        sendResponse({ ok: true, settings: safeClone(settingsCache) });
+        sendResponse({
+          ok: true,
+          settings: settingsForBroadcast(settingsCache)
+        });
       } else if (message.type === "save-settings") {
         sendResponse({
           ok: true,
-          settings: await saveSettings(message.settings || {})
+          settings: await saveSettings(
+            sanitizeSettingsPatch(message.settings, {
+              fromExtensionPage: isExtensionPageSender(sender)
+            })
+          )
         });
+      } else if (message.type === "test-translation-api") {
+        if (!isExtensionPageSender(sender)) {
+          rejectNonExtensionSender(sendResponse);
+          return;
+        }
+        try {
+          sendResponse({ ok: true, result: await testTranslationApi() });
+        } catch (error) {
+          sendResponse({
+            ok: false,
+            error: error?.message || String(error)
+          });
+        }
       } else if (message.type === "open-monitor") {
         await openMonitorWindow();
         sendResponse({ ok: true });
@@ -812,7 +1654,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({
           ok: true,
           state: compactRuntimeState(),
-          settings: safeClone(settingsCache)
+          settings: settingsForBroadcast(settingsCache)
         });
       } else if (message.type === "probe-services") {
         sendResponse({ ok: true, services: await probeServices() });

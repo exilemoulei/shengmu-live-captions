@@ -3,7 +3,10 @@ param(
     [int]$TranslationPort = 8013,
     [int]$WlkPort = 8010,
     [switch]$Restart,
+    [switch]$AsrOnly,
     [switch]$TranslateOnComplete,
+    [double]$PauseSegmentationSeconds = 1.0,
+    [double]$TranslationMaxSegmentSeconds = 2.5,
     [string]$Glossary = ''
 )
 
@@ -75,7 +78,7 @@ function ConvertTo-ProcessArgument([string]$Value) {
     return $builder.ToString()
 }
 
-if (-not (Test-Path -LiteralPath $translationScript)) {
+if (-not $AsrOnly -and -not (Test-Path -LiteralPath $translationScript)) {
     throw "Translation launcher not found: $translationScript"
 }
 if (-not (Test-Path -LiteralPath $wlkServer)) {
@@ -88,36 +91,49 @@ if ($Restart) {
         -WlkPort $WlkPort
 }
 
-$translationListeners = Get-PortListeners $TranslationPort
-if ($translationListeners.Count -eq 0) {
-    $translationStart = & $translationScript `
-        -Port $TranslationPort `
-        -Alias $translationAlias `
-        -ContextSize 2048
-} else {
-    try {
-        $models = Invoke-RestMethod "http://127.0.0.1:$TranslationPort/v1/models" -TimeoutSec 5
-        $loadedAliases = @(
-            $models.data |
-                Select-Object -ExpandProperty id -Unique
-        )
-        if ($loadedAliases -notcontains $translationAlias) {
-            throw "Port $TranslationPort is serving: $($loadedAliases -join ', ')"
-        }
-    } catch {
-        throw "Port $TranslationPort is occupied but does not expose $translationAlias. Use -Restart only after confirming the process is yours. $($_.Exception.Message)"
-    }
+if ($AsrOnly) {
     $translationStart = [pscustomobject]@{
-        Status = 'running'
+        Status = 'skipped'
         Port = $TranslationPort
-        Model = $translationAlias
-        Pid = $translationListeners -join ','
+        Model = 'ASR only'
+        Pid = ''
     }
-}
+    $leftoverTranslation = @(Get-PortListeners $TranslationPort)
+    if ($leftoverTranslation.Count -gt 0) {
+        Write-Warning "Port $TranslationPort is still serving a translation model. Stop it (or use -Restart) to free GPU memory."
+    }
+} else {
+    $translationListeners = Get-PortListeners $TranslationPort
+    if ($translationListeners.Count -eq 0) {
+        $translationStart = & $translationScript `
+            -Port $TranslationPort `
+            -Alias $translationAlias `
+            -ContextSize 2048
+    } else {
+        try {
+            $models = Invoke-RestMethod "http://127.0.0.1:$TranslationPort/v1/models" -TimeoutSec 5
+            $loadedAliases = @(
+                $models.data |
+                    Select-Object -ExpandProperty id -Unique
+            )
+            if ($loadedAliases -notcontains $translationAlias) {
+                throw "Port $TranslationPort is serving: $($loadedAliases -join ', ')"
+            }
+        } catch {
+            throw "Port $TranslationPort is occupied but does not expose $translationAlias. Use -Restart only after confirming the process is yours. $($_.Exception.Message)"
+        }
+        $translationStart = [pscustomobject]@{
+            Status = 'running'
+            Port = $TranslationPort
+            Model = $translationAlias
+            Pid = $translationListeners -join ','
+        }
+    }
 
-$translationHealth = Wait-ForHealth "http://127.0.0.1:$TranslationPort/health" 120
-if (-not $translationHealth) {
-    throw "Translation server did not become ready on port $TranslationPort."
+    $translationHealth = Wait-ForHealth "http://127.0.0.1:$TranslationPort/health" 120
+    if (-not $translationHealth) {
+        throw "Translation server did not become ready on port $TranslationPort."
+    }
 }
 
 $wlkListeners = Get-PortListeners $WlkPort
@@ -127,6 +143,9 @@ if ($wlkListeners.Count -gt 0) {
         throw "Port $WlkPort is occupied but WhisperLiveKit health check failed. Use -Restart to replace this project's service."
     }
     $wlkStatus = 'running'
+    if ($AsrOnly) {
+        throw "WhisperLiveKit is already running on port $WlkPort and may still translate. Use -Restart to apply ASR-only mode."
+    }
 } else {
     $wlkArgs = @(
         '--host', '127.0.0.1',
@@ -134,7 +153,9 @@ if ($wlkListeners.Count -gt 0) {
         '--backend', 'faster-whisper',
         '--model', 'large-v3-turbo',
         '--lan', 'en',
-        '--pause-segmentation-seconds', '1',
+        '--pause-segmentation-seconds', $PauseSegmentationSeconds.ToString(
+            [Globalization.CultureInfo]::InvariantCulture
+        ),
         '--pcm-input',
         '--backend-policy', 'localagreement',
         '--asr-coalesce-min-s', '0.5',
@@ -142,17 +163,24 @@ if ($wlkListeners.Count -gt 0) {
         '--retention-seconds', '300',
         '--buffer_trimming', 'segment',
         '--buffer_trimming_sec', '4',
-        '--target-language', 'zh',
-        '--translation-backend', 'openai',
-        '--openai-translation-url', "http://127.0.0.1:$TranslationPort/v1",
-        '--openai-translation-model', $translationAlias,
-        '--openai-translation-max-tokens', '768',
         '--log-level', 'INFO'
     )
-    if ($TranslateOnComplete) {
+    if (-not $AsrOnly) {
+        $wlkArgs += @(
+            '--target-language', 'zh',
+            '--translation-backend', 'openai',
+            '--openai-translation-url', "http://127.0.0.1:$TranslationPort/v1",
+            '--openai-translation-model', $translationAlias,
+            '--openai-translation-max-tokens', '768',
+            '--openai-translation-max-segment-seconds', $TranslationMaxSegmentSeconds.ToString(
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+        )
+    }
+    if ($TranslateOnComplete -and -not $AsrOnly) {
         $wlkArgs += '--translate-on-complete'
     }
-    if ($Glossary) {
+    if ($Glossary -and -not $AsrOnly) {
         $wlkArgs += @('--openai-translation-glossary', $Glossary)
     }
 
@@ -180,12 +208,14 @@ if ($wlkListeners.Count -gt 0) {
 
 [pscustomobject]@{
     Translation = $translationStart.Status
-    TranslationPort = $TranslationPort
-    TranslationModel = $translationAlias
+    TranslationPort = if ($AsrOnly) { 'disabled' } else { $TranslationPort }
+    TranslationModel = if ($AsrOnly) { 'ASR only' } else { $translationAlias }
     Wlk = $wlkStatus
     WlkPort = $WlkPort
     WlkBackend = 'faster-whisper'
     WlkModel = 'large-v3-turbo'
-    TranslateOnComplete = [bool]$TranslateOnComplete
-    Glossary = $Glossary
+    TranslateOnComplete = if ($AsrOnly) { $false } else { [bool]$TranslateOnComplete }
+    PauseSegmentationSeconds = $PauseSegmentationSeconds
+    TranslationMaxSegmentSeconds = $TranslationMaxSegmentSeconds
+    Glossary = if ($AsrOnly) { '' } else { $Glossary }
 } | Format-List
