@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>声幕</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">声</span>
+        <div>
+          <strong>声幕</strong>
+          <span>LIVE INTERPRETER</span>
+        </div>
+      </div>
+      <button id="openMonitor" class="text-button" type="button">字幕记录</button>
+    </header>
+
+    <main>
+      <section class="now-card">
+        <p class="eyebrow">当前声源</p>
+        <h1 id="tabTitle">正在读取标签页</h1>
+        <p id="tabUrl" class="tab-url">Chrome tab</p>
+        <div class="status-row">
+          <span id="statusDot" class="status-dot"></span>
+          <span id="statusLabel">准备就绪</span>
+          <span id="audioRatio" class="ratio"></span>
+        </div>
+        <p id="livePreview" class="live-preview" hidden></p>
+      </section>
+
+      <button id="primaryButton" class="primary-button" type="button">
+        <span class="button-kicker">TAB AUDIO</span>
+        <span id="primaryLabel">开始实时翻译</span>
+      </button>
+
+      <p id="errorMessage" class="error-message" role="alert" hidden></p>
+
+      <section class="controls" aria-label="字幕显示设置">
+        <div class="control-row">
+          <label for="displayMode">显示</label>
+          <select id="displayMode">
+            <option value="bilingual">中英双语</option>
+            <option value="chinese">仅中文</option>
+            <option value="english">仅英文</option>
+          </select>
+        </div>
+        <div class="control-row range-row">
+          <label for="fontSize">字号</label>
+          <input id="fontSize" type="range" min="20" max="64" step="1">
+          <output id="fontSizeValue" for="fontSize">34</output>
+        </div>
+        <label class="switch-row">
+          <span>
+            <strong>页面浮层</strong>
+            <small>覆盖在直播画面上</small>
+          </span>
+          <input id="overlayEnabled" type="checkbox">
+          <i aria-hidden="true"></i>
+        </label>
+        <label class="switch-row">
+          <span>
+            <strong>自动打开记录</strong>
+            <small>开始后显示字幕面板</small>
+          </span>
+          <input id="openPanelOnStart" type="checkbox">
+          <i aria-hidden="true"></i>
+        </label>
+      </section>
+
+      <details class="advanced">
+        <summary>连接设置</summary>
+        <label for="wsUrl">ASR WebSocket</label>
+        <input id="wsUrl" type="url" spellcheck="false">
+        <button id="probeButton" class="outline-button" type="button">检查本地服务</button>
+        <div id="serviceResults" class="service-results" hidden></div>
+      </details>
+    </main>
+
+    <footer>
+      <span>Ctrl + Shift + Y</span>
+      <button id="openMonitorFooter" class="text-button" type="button">查看全部记录</button>
+    </footer>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
