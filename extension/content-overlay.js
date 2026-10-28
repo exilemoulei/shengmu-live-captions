@@ -1,10 +1,13 @@
 (() => {
-  const OVERLAY_VERSION = 2;
+  const OVERLAY_VERSION = 3;
   const existing = globalThis.__shengmuCaptionOverlay;
   if (existing?.version === OVERLAY_VERSION && existing.refresh) {
     existing.refresh();
     return;
   }
+  // A leftover overlay from an older injection still holds window-level
+  // listeners; retire it before this instance binds its own.
+  existing?.teardown?.();
 
   const DEFAULT_SETTINGS = {
     displayMode: "bilingual",
@@ -30,21 +33,31 @@
   let modeButton = null;
   let idleTimer = null;
   let positionStore = {};
+  let positionPending = false;
   let dragState = null;
+  let sizeObserver = null;
+  let stageRectCache = null;
+  let historyRectCache = null;
+  let lastPanelRect = null;
 
-  // Wheel-up scrollback: historyEntries is a rolling log of finished lines,
-  // scrollbackSnapshot freezes it when the reader starts scrolling so live
-  // captions do not push the text they are reading around.
+  // Wheel-up scrollback: historyLog is a rolling log of finished lines.
+  // scrollbackSnapshot freezes the list of ids (not the text) when the reader
+  // starts scrolling, so live captions cannot push the lines around while late
+  // translations still land in the rows already on screen.
   const HISTORY_LIMIT = 60;
   const MAX_SCROLLBACK = 40;
   const WHEEL_STEP_PX = 48;
-  let historyEntries = [];
+  const WHEEL_COOLDOWN_MS = 700;
+  const IDLE_FADE_MS = 3500;
+  const HISTORY_API = globalThis.ShengmuOverlayHistory;
+  const historyLog = HISTORY_API.createHistoryLog(HISTORY_LIMIT);
   let scrollbackSnapshot = null;
   let scrollBack = 0;
   let wheelAccum = 0;
   let wheelCooldownUntil = 0;
   let renderedScrollbackKey = "";
-  let wheelBound = false;
+  let syncedLinesRef = null;
+  let windowListenersBound = false;
 
   function clean(value) {
     return String(value ?? "").replace(/\s+/g, " ").trim();
@@ -75,10 +88,10 @@
   }
 
   function buildOverlay() {
-    // Extension reloads can leave a detached isolated-world host behind.
-    document
-      .querySelectorAll("#shengmu-caption-host")
-      .forEach((existingHost) => existingHost.remove());
+    // Extension reloads can leave a detached isolated-world host behind. An
+    // older build has no teardown() and its fullscreenchange handler can still
+    // re-append its host, so hide stale hosts as well as removing them.
+    retireStaleHosts();
     host = document.createElement("div");
     host.id = "shengmu-caption-host";
     host.style.cssText =
@@ -403,6 +416,11 @@
     modeButton = shadow.querySelector('[data-action="mode"]');
     mount();
     bindEvents();
+    bindWindowListeners();
+    watchSize();
+    renderedScrollbackKey = "";
+    stageRectCache = null;
+    historyRectCache = null;
   }
 
   function mount() {
@@ -413,6 +431,8 @@
         ? fullscreenElement
         : document.documentElement;
     if (host.parentNode !== target) target.appendChild(host);
+    stageRectCache = null;
+    historyRectCache = null;
   }
 
   function bindEvents() {
@@ -441,6 +461,8 @@
       stage.style.left = `${left}px`;
       stage.style.top = `${top}px`;
       stage.style.bottom = "auto";
+      stageRectCache = null;
+      historyRectCache = null;
     });
     const endDrag = (event) => {
       if (!dragState || dragState.pointerId !== event.pointerId) return;
@@ -453,6 +475,8 @@
       };
       void chrome.storage.local.set({ [POSITION_KEY]: positionStore });
       dragState = null;
+      stageRectCache = null;
+      historyRectCache = null;
     };
     shadow.querySelector(".drag-handle").addEventListener("pointerup", endDrag);
     shadow.querySelector(".drag-handle").addEventListener("pointercancel", endDrag);
@@ -481,23 +505,55 @@
         });
       }
     });
+  }
 
-    window.addEventListener("resize", applyStoredPosition);
-    document.addEventListener("fullscreenchange", () => {
-      mount();
-      applyStoredPosition();
+  function retireStaleHosts() {
+    document.querySelectorAll("#shengmu-caption-host").forEach((staleHost) => {
+      if (staleHost === host) return;
+      // display:none keeps a re-mounted stale overlay invisible and leaves it
+      // with a zero-size hit box, so it cannot swallow wheel events.
+      staleHost.style.display = "none";
+      staleHost.remove();
     });
+  }
+
+  function handleFullscreenChange() {
+    mount();
+    applyStoredPosition();
+    // A 0.4.1 instance re-appends its host from its own fullscreenchange
+    // handler without asking us; its listener runs first, so sweep again.
+    retireStaleHosts();
+  }
+
+  // Bound once per overlay instance: the wheel hit test and the position
+  // refresh live outside the shadow root, so a later rebuild must not stack a
+  // second copy of these listeners. teardown() is the counterpart.
+  function bindWindowListeners() {
+    if (windowListenersBound) return;
+    windowListenersBound = true;
+    window.addEventListener("resize", applyStoredPosition);
     // The stage is pointer-events:none so it never blocks the player. Wheel
     // events are therefore caught here in the capture phase: only when the
     // pointer is over the caption box, and only while we actually consume the
     // scroll (history open, or scrolling up to open it).
-    if (!wheelBound) {
-      wheelBound = true;
-      window.addEventListener("wheel", handleWheel, {
-        capture: true,
-        passive: false
-      });
-    }
+    window.addEventListener("wheel", handleWheel, {
+      capture: true,
+      passive: false
+    });
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+  }
+
+  // Wheel hit tests read layout boxes; ResizeObserver invalidates the cache on
+  // any real geometry change, so a scroll burst costs no layout reads.
+  function watchSize() {
+    if (typeof ResizeObserver !== "function") return;
+    if (sizeObserver) sizeObserver.disconnect();
+    sizeObserver = new ResizeObserver(() => {
+      stageRectCache = null;
+      historyRectCache = null;
+    });
+    sizeObserver.observe(stage);
+    if (historyElement) sizeObserver.observe(historyElement);
   }
 
   async function saveSettings(patch) {
@@ -529,16 +585,32 @@
   }
 
   function applyStoredPosition() {
-    if (!stage) return;
+    if (!stage || dragState) return;
+    // Any reposition (load, resize, fullscreen) invalidates the wheel hit-test
+    // cache, including the default bottom-centred placement.
+    stageRectCache = null;
+    historyRectCache = null;
     const position = positionStore[siteKey()];
-    if (!position) return;
+    if (!position) {
+      positionPending = false;
+      return;
+    }
     const rect = stage.getBoundingClientRect();
+    // A hidden stage has no layout box; using it as the stage size would place
+    // the overlay at the far edge of the viewport. Retry once it is visible.
+    if (stage.hidden || rect.width === 0 || rect.height === 0) {
+      positionPending = true;
+      return;
+    }
+    positionPending = false;
     const widthRange = Math.max(1, window.innerWidth - rect.width);
     const heightRange = Math.max(1, window.innerHeight - rect.height);
     stage.classList.add("dragged");
     stage.style.left = `${Math.round(Math.max(0, Math.min(1, position.x)) * widthRange)}px`;
     stage.style.top = `${Math.round(Math.max(0, Math.min(1, position.y)) * heightRange)}px`;
     stage.style.bottom = "auto";
+    stageRectCache = null;
+    historyRectCache = null;
   }
 
   function applyVisualSettings() {
@@ -559,38 +631,48 @@
   }
 
   // Rolling log of finished lines. The worker caps runtimeState.current.lines,
-  // so the overlay keeps its own copy for wheel-up history.
+  // so the overlay keeps its own copy for wheel-up history. The array identity
+  // check skips the merge when the worker re-broadcasts an unchanged list.
   function syncHistory() {
     const lines = Array.isArray(runtimeState?.current?.lines)
       ? runtimeState.current.lines
       : [];
-    if (lines.length === 0) return;
-    const byId = new Map(historyEntries.map((entry) => [entry.id, entry]));
+    if (lines === syncedLinesRef) return false;
+    syncedLinesRef = lines;
+    if (lines.length === 0) return false;
+    // The worker sends its whole 120-line window; once our 60-line log is full,
+    // anything older than its first row would be inserted and trimmed again on
+    // every broadcast, so drop it before the string normalisation.
+    const retainedFrom =
+      historyLog.entries.length >= historyLog.limit
+        ? historyLog.entries[0].order
+        : 0;
+    const normalized = [];
     for (const line of lines) {
+      const order = Number(line?.order) || 0;
+      if (
+        retainedFrom > 0 &&
+        order > 0 &&
+        order <= retainedFrom &&
+        !historyLog.byId.has(line.id)
+      ) {
+        continue;
+      }
       const source = clean(line?.source);
       const translation = lineTranslation(line);
       if (!source && !translation) continue;
-      const id = line.id || `${line.order ?? ""}:${source.slice(0, 32)}`;
-      const existing = byId.get(id);
-      if (existing) {
-        if (translation) existing.translation = translation;
-        if (source) existing.source = source;
-      } else {
-        byId.set(id, {
-          id,
-          source,
-          translation,
-          order: Number(line.order) || 0
-        });
-      }
+      normalized.push({
+        id: line.id || `${line.order ?? ""}:${source.slice(0, 32)}`,
+        order,
+        source,
+        translation
+      });
     }
-    historyEntries = [...byId.values()]
-      .sort((left, right) => (left.order || 0) - (right.order || 0))
-      .slice(-HISTORY_LIMIT);
+    return HISTORY_API.syncHistoryLog(historyLog, normalized);
   }
 
   function scrollbackEntries() {
-    const entries = historyEntries.filter(
+    const entries = historyLog.entries.filter(
       (entry) => entry.translation || entry.source
     );
     const caption = latestCaption();
@@ -604,7 +686,7 @@
   }
 
   function previousTranslation(caption) {
-    const entries = historyEntries.filter((entry) => entry.translation);
+    const entries = historyLog.entries.filter((entry) => entry.translation);
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const entry = entries[index];
       if (caption.lineId && entry.id === caption.lineId) continue;
@@ -614,16 +696,28 @@
     return "";
   }
 
+  // The snapshot freezes the rows themselves (not ids): later log trimming can
+  // no longer make an on-screen row disappear, while a late translation still
+  // lands because the log patches the same entry object in place.
+  function scrollbackView() {
+    if (!scrollbackSnapshot || scrollBack <= 0) return [];
+    return scrollbackSnapshot
+      .slice(-scrollBack)
+      .filter((entry) => entry.translation || entry.source);
+  }
+
   function maxScrollBack() {
     return Math.min((scrollbackSnapshot || []).length, MAX_SCROLLBACK);
   }
 
   function openScrollback() {
-    if (!scrollbackSnapshot) {
-      scrollbackSnapshot = scrollbackEntries();
+    // An empty result must not be frozen: the reader may retry once lines land.
+    if (!scrollbackSnapshot || scrollbackSnapshot.length === 0) {
+      const entries = scrollbackEntries();
+      scrollbackSnapshot = entries.length > 0 ? entries : null;
       wheelAccum = 0;
     }
-    return scrollbackSnapshot.length > 0;
+    return Boolean(scrollbackSnapshot && scrollbackSnapshot.length > 0);
   }
 
   function closeScrollback() {
@@ -636,8 +730,7 @@
 
   function renderScrollback() {
     if (!historyElement || !historyListElement || !chipElement) return;
-    const entries =
-      scrollBack > 0 ? (scrollbackSnapshot || []).slice(-scrollBack) : [];
+    const entries = scrollbackView();
     if (entries.length === 0) {
       if (!historyElement.hidden) historyElement.hidden = true;
       if (historyListElement.childElementCount) {
@@ -645,6 +738,7 @@
       }
       chipElement.textContent = "";
       renderedScrollbackKey = "";
+      historyRectCache = null;
       return;
     }
 
@@ -675,7 +769,10 @@
 
     // Unhide before measuring: a hidden panel has no layout, so scrollTop
     // cannot be anchored to the newest line until it is visible.
+    const wasHidden = historyElement.hidden;
     historyElement.hidden = false;
+    if (wasHidden) historyRectCache = null;
+    lastPanelRect = historyRect();
     historyListElement.scrollTop = historyListElement.scrollHeight;
     historyListElement.classList.toggle(
       "overflowing",
@@ -688,21 +785,44 @@
         : `历史 ${entries.length} 条 · 向下滚回实时`;
   }
 
-  function handleWheel(event) {
-    if (!stage || stage.hidden) return;
-    if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
-    const rects = [stage.getBoundingClientRect()];
+  function stageRect() {
+    if (!stageRectCache) stageRectCache = stage.getBoundingClientRect();
+    return stageRectCache;
+  }
+
+  function historyRect() {
+    if (!historyRectCache) historyRectCache = historyElement.getBoundingClientRect();
+    return historyRectCache;
+  }
+
+  // The stage and the history panel are the only wheel targets: the host spans
+  // the whole viewport with pointer-events:none, so hit testing has to use the
+  // cached boxes instead of event.target. While the close cooldown lasts, the
+  // area of the just-closed panel stays part of the overlay as well, otherwise
+  // the tail of the same gesture would scroll the page.
+  function pointerInsideOverlay(event) {
+    const rects = [stageRect()];
     if (historyElement && !historyElement.hidden) {
-      rects.push(historyElement.getBoundingClientRect());
+      rects.push(historyRect());
+    } else if (lastPanelRect && performance.now() < wheelCooldownUntil) {
+      rects.push(lastPanelRect);
     }
-    const inside = rects.some(
+    return rects.some(
       (rect) =>
         event.clientX >= rect.left &&
         event.clientX <= rect.right &&
         event.clientY >= rect.top &&
         event.clientY <= rect.bottom
     );
-    if (!inside) return;
+  }
+
+  function handleWheel(event) {
+    if (!stage || stage.hidden) return;
+    // A retired instance can still be alive for a moment after its host was
+    // replaced; never let it keep swallowing page scroll.
+    if (!host?.isConnected) return;
+    if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+    if (!pointerInsideOverlay(event)) return;
 
     const scrollingDown = event.deltaY > 0;
     if (scrollingDown && scrollBack <= 0) {
@@ -744,7 +864,7 @@
     // Reaching the newest line closes the history panel again.
     if (scrollBack === 0) {
       scrollbackSnapshot = null;
-      wheelCooldownUntil = performance.now() + 700;
+      wheelCooldownUntil = performance.now() + WHEEL_COOLDOWN_MS;
     }
     // render() also refreshes the dual-line context, which steps aside while
     // the reader is looking at the history panel.
@@ -834,37 +954,55 @@
     errorElement.textContent = caption.error;
     errorElement.classList.toggle("visible", Boolean(caption.error));
 
+    // reveal first, then resolve a position that was requested while hidden
+    if (positionPending) applyStoredPosition();
     renderScrollback();
 
     if (!active) {
       idleTimer = setTimeout(() => {
         if (stage && scrollBack === 0) stage.style.opacity = "0.35";
-      }, 3500);
+      }, IDLE_FADE_MS);
+    }
+  }
+
+  function resetSessionHistory() {
+    HISTORY_API.resetHistoryLog(historyLog);
+    syncedLinesRef = null;
+    scrollbackSnapshot = null;
+    scrollBack = 0;
+    wheelAccum = 0;
+  }
+
+  // Single entry point for runtime-state replacement so every path (message or
+  // refresh response) applies the same session-switch cleanup.
+  function setRuntimeState(next) {
+    const previousSessionId = runtimeState?.sessionId || null;
+    runtimeState = next;
+    if ((runtimeState?.sessionId || null) !== previousSessionId) {
+      resetSessionHistory();
     }
   }
 
   function applyMessage(message) {
-    const previousSessionId = runtimeState?.sessionId || null;
     if (message.settings) {
       settings = { ...settings, ...message.settings };
     }
     if (message.state) {
-      runtimeState = message.state;
+      setRuntimeState(message.state);
     }
     if (message.type === "caption-state" && message.payload) {
-      runtimeState = {
+      setRuntimeState({
         ...(runtimeState || {}),
         ...message.payload
-      };
-    }
-    if ((runtimeState?.sessionId || null) !== previousSessionId) {
-      historyEntries = [];
-      closeScrollback();
+      });
     }
     render();
   }
 
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  function handleRuntimeMessage(message, sender, sendResponse) {
+    // A retired instance keeps its listener for a moment after teardown; it
+    // must not touch a stage that is already gone.
+    if (!stage) return false;
     if (message?.target !== "content") return false;
     if (message.type === "init" || message.type === "caption-state") {
       applyMessage(message);
@@ -878,10 +1016,12 @@
     }
     sendResponse({ ok: true });
     return false;
-  });
+  }
+
+  chrome.runtime.onMessage.addListener(handleRuntimeMessage);
 
   async function refresh() {
-    if (!host) buildOverlay();
+    if (!host || !host.isConnected) buildOverlay();
     try {
       const response = await chrome.runtime.sendMessage({
         target: "background",
@@ -889,7 +1029,7 @@
       });
       if (response?.ok) {
         if (response.settings) settings = { ...settings, ...response.settings };
-        if (response.state) runtimeState = response.state;
+        if (response.state) setRuntimeState(response.state);
         render();
       }
     } catch {
@@ -897,14 +1037,66 @@
     }
   }
 
+  // Counterpart of bindWindowListeners(): drop every listener this instance
+  // owns so a re-injected overlay cannot answer the same wheel twice.
+  function teardown() {
+    if (windowListenersBound) {
+      windowListenersBound = false;
+      window.removeEventListener("resize", applyStoredPosition);
+      window.removeEventListener("wheel", handleWheel, { capture: true });
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    }
+    if (sizeObserver) {
+      sizeObserver.disconnect();
+      sizeObserver = null;
+    }
+    clearTimeout(idleTimer);
+    idleTimer = null;
+    try {
+      chrome.runtime.onMessage.removeListener(handleRuntimeMessage);
+    } catch {
+      // The extension context may already be gone; nothing left to detach.
+    }
+    if (host) host.remove();
+    host = null;
+    shadow = null;
+    stage = null;
+    sourceElement = null;
+    translationElement = null;
+    previousElement = null;
+    historyElement = null;
+    historyListElement = null;
+    chipElement = null;
+    statusElement = null;
+    modeButton = null;
+    dragState = null;
+    positionPending = false;
+    stageRectCache = null;
+    historyRectCache = null;
+    scrollbackSnapshot = null;
+    scrollBack = 0;
+    wheelAccum = 0;
+    renderedScrollbackKey = "";
+    syncedLinesRef = null;
+    HISTORY_API.resetHistoryLog(historyLog);
+    if (globalThis.__shengmuCaptionOverlay?.teardown === teardown) {
+      delete globalThis.__shengmuCaptionOverlay;
+    }
+  }
+
   globalThis.__shengmuCaptionOverlay = {
     version: OVERLAY_VERSION,
     refresh,
+    teardown,
     get state() {
       return runtimeState;
     },
     get settings() {
       return settings;
+    },
+    // Read-only diagnostics for the UI smoke harness.
+    get history() {
+      return { size: historyLog.entries.length, limit: historyLog.limit };
     }
   };
 

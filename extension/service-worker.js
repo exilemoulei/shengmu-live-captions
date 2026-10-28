@@ -357,7 +357,7 @@ async function injectOverlay(tabId = runtimeState.tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ["content-overlay.js"]
+      files: ["overlay-history.js", "content-overlay.js"]
     });
   } catch (error) {
     console.warn("声幕页面浮层注入失败", error);
