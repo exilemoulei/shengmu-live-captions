@@ -50,7 +50,9 @@ export const EMPTY_RUNTIME_STATE = Object.freeze({
   }
 });
 
-const DISPLAY_MODES = new Set(["bilingual", "chinese", "english"]);
+// "dual" keeps the previous translated line above the current one, so a
+// sentence cut in two by the ASR segmenter still reads continuously.
+const DISPLAY_MODES = new Set(["bilingual", "dual", "chinese", "english"]);
 
 // Content scripts only need presentation settings. Translation/API settings
 // must come from an extension page so a page-side script cannot redirect the
@@ -327,6 +329,30 @@ export function mergeCaptionLines(existingLines, incomingLines, limit = 20000) {
     (left, right) => (left.order || 0) - (right.order || 0)
   );
   return result.length > limit ? result.slice(result.length - limit) : result;
+}
+
+/**
+ * Decides how to update an append-only transcript list.
+ *
+ * The live caption page keeps a window of the newest rows, so a new line can
+ * either be appended at the end or push the oldest row out of the window. Any
+ * other change (filter, session switch, reordering) needs a full rebuild.
+ */
+export function planTranscriptDiff(previousIds = [], nextIds = []) {
+  const previous = Array.isArray(previousIds) ? previousIds : [];
+  const next = Array.isArray(nextIds) ? nextIds : [];
+  let drop = 0;
+  if (previous.length > 0 && next.length > 0) {
+    drop = previous.indexOf(next[0]);
+    if (drop < 0) return { rebuild: true, drop: 0 };
+  }
+  if (next.length < previous.length - drop) {
+    return { rebuild: true, drop: 0 };
+  }
+  const aligned = previous
+    .slice(drop)
+    .every((id, index) => id === next[index]);
+  return aligned ? { rebuild: false, drop } : { rebuild: true, drop: 0 };
 }
 
 export function lineChanged(previous, next) {

@@ -6,6 +6,7 @@ import {
   hostnameFromUrl,
   mergeCaptionLines,
   normalizeSettings,
+  planTranscriptDiff,
   safeFileStem
 } from "./caption-utils.js";
 import {
@@ -72,7 +73,15 @@ let transcriptRenderTimer = null;
 let toastTimer = null;
 let searchTimer = null;
 let sessionsRefreshTimer = null;
-let lastRenderedLineId = null;
+
+// Incremental transcript rendering state. Rebuilding the whole list on every
+// caption message (every ~80 ms while live) replayed the entry animation and
+// fought the scroll position, which is what made the page flicker.
+const lineViews = new Map();
+let renderedLineIds = [];
+let renderedViewKey = "";
+let followFrame = 0;
+let sessionListSignature = "";
 
 function formatDate(timestamp) {
   if (!timestamp) return "未知时间";
@@ -255,6 +264,26 @@ function renderSessionList() {
       .includes(needle);
   });
 
+  const signature = [
+    needle,
+    selectedSessionId || "",
+    runtimeState?.active ? runtimeState.sessionId || "live" : "",
+    filtered
+      .map((session) =>
+        [
+          session.id,
+          session.title,
+          session.startedAt,
+          session.lineCount,
+          session.translationMissing,
+          session.preview
+        ].join("\u0001")
+      )
+      .join("\u0002")
+  ].join("\u0003");
+  if (signature === sessionListSignature) return;
+  sessionListSignature = signature;
+
   if (filtered.length === 0) {
     const empty = document.createElement("div");
     empty.className = "rail-empty";
@@ -319,31 +348,144 @@ function renderSessionList() {
   elements.sessionList.replaceChildren(fragment);
 }
 
-function lineElement(line, isLatest) {
+function lineSignature(line, isLatest) {
+  return [
+    line.start || "",
+    isLatest ? "1" : "0",
+    line.translation || "",
+    line.source || ""
+  ].join("\u0001");
+}
+
+function createLineView(line, isLatest) {
   const article = document.createElement("article");
   article.className = "transcript-line";
-  if (isLatest) article.classList.add("is-new");
 
   const time = document.createElement("span");
   time.className = "line-time";
-  time.textContent = line.start
-    ? formatClock(line.start)
-    : formatDate(line.updatedAt);
 
   const content = document.createElement("div");
   content.className = "line-content";
 
   const translation = document.createElement("p");
   translation.className = "line-translation";
-  translation.textContent = line.translation || line.source || "";
 
   const source = document.createElement("span");
   source.className = "line-source";
-  source.textContent = line.source || "";
 
   content.append(translation, source);
   article.append(time, content);
-  return article;
+
+  const view = { article, time, translation, source, signature: "" };
+  updateLineView(view, line, isLatest);
+  return view;
+}
+
+function updateLineView(view, line, isLatest) {
+  const signature = lineSignature(line, isLatest);
+  if (view.signature === signature) return false;
+  view.signature = signature;
+  view.time.textContent = line.start
+    ? formatClock(line.start)
+    : formatDate(line.updatedAt);
+  view.translation.textContent = line.translation || line.source || "";
+  view.source.textContent = line.source || "";
+  view.article.classList.toggle("is-latest", Boolean(isLatest));
+  return true;
+}
+
+function markIncomingLine(article) {
+  if (!article) return;
+  article.classList.add("is-new");
+  article.addEventListener(
+    "animationend",
+    () => article.classList.remove("is-new"),
+    { once: true }
+  );
+}
+
+function transcriptViewKey() {
+  return [
+    selectedSessionId || "",
+    transcriptQuery,
+    settings.displayMode,
+    visibleCount,
+    selectedIsLive() ? "live" : "past"
+  ].join("|");
+}
+
+function lineKey(line, index) {
+  return line.id || `idx-${index}`;
+}
+
+// Appends only genuinely new rows and patches rows whose text changed. The
+// visible list is otherwise left untouched so scrolling stays stable.
+function syncTranscriptLines(visibleLines, isLive, latestId) {
+  const list = elements.transcriptList;
+  const viewKey = transcriptViewKey();
+  // Rows without a stable id (should not happen with history rows) cannot be
+  // diffed safely, so they always take the rebuild path.
+  const hasAnonymous = visibleLines.some((line) => !line.id);
+  const nextIds = visibleLines.map((line, index) => lineKey(line, index));
+  const prevIds = renderedLineIds;
+  const diff = hasAnonymous
+    ? { rebuild: true, drop: 0 }
+    : planTranscriptDiff(prevIds, nextIds);
+  const canAppend = viewKey === renderedViewKey && !diff.rebuild;
+
+  if (!canAppend) {
+    const fragment = document.createDocumentFragment();
+    lineViews.clear();
+    visibleLines.forEach((line, index) => {
+      const isLatest =
+        isLive && line.id === latestId && index === visibleLines.length - 1;
+      const view = createLineView(line, isLatest);
+      lineViews.set(lineKey(line, index), view);
+      fragment.append(view.article);
+    });
+    list.replaceChildren(fragment);
+    renderedLineIds = nextIds;
+    renderedViewKey = viewKey;
+    return;
+  }
+
+  for (let index = 0; index < diff.drop; index += 1) {
+    const view = lineViews.get(prevIds[index]);
+    if (view) view.article.remove();
+    lineViews.delete(prevIds[index]);
+  }
+
+  const appended = [];
+  visibleLines.forEach((line, index) => {
+    const key = lineKey(line, index);
+    const isLatest =
+      isLive && line.id === latestId && index === visibleLines.length - 1;
+    const existing = lineViews.get(key);
+    if (existing) {
+      updateLineView(existing, line, isLatest);
+      return;
+    }
+    const view = createLineView(line, isLatest);
+    lineViews.set(key, view);
+    list.append(view.article);
+    appended.push(view.article);
+  });
+  renderedLineIds = nextIds;
+  markIncomingLine(appended.at(-1));
+}
+
+function scheduleFollowScroll() {
+  elements.scrollLatest.hidden = true;
+  if (followFrame) cancelAnimationFrame(followFrame);
+  followFrame = requestAnimationFrame(() => {
+    followFrame = 0;
+    if (!followLatest) return;
+    const viewport = elements.transcriptViewport;
+    const target = viewport.scrollHeight;
+    if (Math.abs(viewport.scrollTop + viewport.clientHeight - target) > 2) {
+      viewport.scrollTop = target;
+    }
+  });
 }
 
 function filteredTranscriptLines() {
@@ -376,24 +518,13 @@ function renderTranscript() {
     return;
   }
 
+  const shouldFollow = followLatest || isNearBottom();
   elements.transcriptList.className = `transcript-list display-${settings.displayMode}`;
   const resultLimit = transcriptQuery ? MAX_SEARCH_RESULTS : visibleCount;
   const visibleLines = filtered.slice(-resultLimit);
-  const shouldFollow = followLatest || isNearBottom();
-  lastRenderedLineId = allLines.at(-1)?.id || null;
+  const latestId = allLines.at(-1)?.id || null;
 
-  const fragment = document.createDocumentFragment();
-  visibleLines.forEach((line, index) => {
-    fragment.append(
-      lineElement(
-        line,
-        selectedIsLive() &&
-          line.id === allLines.at(-1)?.id &&
-          index === visibleLines.length - 1
-      )
-    );
-  });
-  elements.transcriptList.replaceChildren(fragment);
+  syncTranscriptLines(visibleLines, selectedIsLive(), latestId);
   elements.loadEarlier.hidden =
     Boolean(transcriptQuery) || filtered.length <= visibleCount;
   elements.loadEarlier.textContent = `载入更早的字幕（还有 ${Math.max(
@@ -403,14 +534,26 @@ function renderTranscript() {
 
   const bufferSource = cleanText(runtimeState?.current?.bufferSource);
   const bufferTranslation = cleanText(runtimeState?.current?.bufferTranslation);
-  elements.interimCard.hidden =
-    !selectedIsLive() || (!bufferSource && !bufferTranslation);
+  const bufferIdle = !bufferSource && !bufferTranslation;
+  // Keep the listening card mounted for the whole live session. Hiding it on
+  // every buffer flap changed the scroll height each time and dragged the
+  // whole transcript up and down.
+  elements.interimCard.hidden = !selectedIsLive();
+  elements.interimCard.classList.toggle("is-idle", bufferIdle);
   elements.interimSource.textContent = bufferSource;
   elements.interimTranslation.textContent = bufferTranslation;
+  if (bufferIdle) {
+    if (settings.displayMode === "english") {
+      elements.interimSource.textContent = "等待下一句…";
+    } else {
+      elements.interimTranslation.textContent = "等待下一句…";
+    }
+  }
+  const sourceVisible =
+    settings.displayMode === "bilingual" || settings.displayMode === "english";
   elements.interimSource.hidden =
-    settings.displayMode === "chinese" || (!bufferSource && !bufferTranslation);
-  elements.interimTranslation.hidden =
-    settings.displayMode === "english" || !bufferTranslation;
+    !sourceVisible || !elements.interimSource.textContent;
+  elements.interimTranslation.hidden = !elements.interimTranslation.textContent;
 
   elements.emptyTranscript.hidden = filtered.length > 0 || !elements.interimCard.hidden;
   if (!elements.emptyTranscript.hidden) {
@@ -425,11 +568,7 @@ function renderTranscript() {
   elements.lineCount.textContent = `${filtered.length} 条字幕`;
   if (shouldFollow) {
     followLatest = true;
-    requestAnimationFrame(() => {
-      elements.transcriptViewport.scrollTop =
-        elements.transcriptViewport.scrollHeight;
-      elements.scrollLatest.hidden = true;
-    });
+    scheduleFollowScroll();
   } else {
     elements.scrollLatest.hidden = false;
   }
@@ -628,10 +767,10 @@ function transcriptPlainText() {
       if (settings.displayMode === "english") {
         return `${time}${line.source || line.translation || ""}`;
       }
-      if (settings.displayMode === "chinese") {
-        return `${time}${line.translation || line.source || ""}`;
+      if (settings.displayMode === "bilingual") {
+        return `${time}${line.translation || ""}\n${line.source || ""}`.trim();
       }
-      return `${time}${line.translation || ""}\n${line.source || ""}`.trim();
+      return `${time}${line.translation || line.source || ""}`;
     })
     .filter((line) => line.replace(/\[[^\]]+\]/g, "").trim())
     .join("\n\n");

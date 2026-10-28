@@ -8,6 +8,7 @@ import {
   migrateLegacySettings,
   normalizeCaptionLines,
   normalizeSettings,
+  planTranscriptDiff,
   sanitizeSettingsPatch,
   selectDisplayCaption,
   settingsForBroadcast,
@@ -25,6 +26,49 @@ test("normalizeSettings defaults to DeepSeek API and validates its fields", () =
     deepseek: "",
     openai: "",
     custom: ""
+  });
+});
+
+test("display mode keeps the dual-line translation option", () => {
+  assert.equal(normalizeSettings({ displayMode: "dual" }).displayMode, "dual");
+  assert.equal(
+    normalizeSettings({ displayMode: "klingon" }).displayMode,
+    "bilingual"
+  );
+  assert.equal(
+    settingsForBroadcast({ displayMode: "dual" }).displayMode,
+    "dual"
+  );
+});
+
+test("planTranscriptDiff appends, slides the window, and rebuilds otherwise", () => {
+  assert.deepEqual(planTranscriptDiff(["a", "b"], ["a", "b", "c"]), {
+    rebuild: false,
+    drop: 0
+  });
+  assert.deepEqual(planTranscriptDiff(["a", "b", "c"], ["b", "c", "d"]), {
+    rebuild: false,
+    drop: 1
+  });
+  assert.deepEqual(planTranscriptDiff(["a", "b", "c"], ["a", "b", "c"]), {
+    rebuild: false,
+    drop: 0
+  });
+  assert.deepEqual(planTranscriptDiff([], ["a"]), {
+    rebuild: false,
+    drop: 0
+  });
+  assert.deepEqual(planTranscriptDiff(["a", "b"], ["x", "y"]), {
+    rebuild: true,
+    drop: 0
+  });
+  assert.deepEqual(planTranscriptDiff(["a", "b", "c"], ["a"]), {
+    rebuild: true,
+    drop: 0
+  });
+  assert.deepEqual(planTranscriptDiff(["a", "b", "c"], ["b", "x", "c"]), {
+    rebuild: true,
+    drop: 0
   });
 });
 

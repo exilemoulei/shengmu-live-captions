@@ -613,7 +613,8 @@ button {
   overflow-y: auto;
   scrollbar-color: rgba(23, 35, 29, 0.22) transparent;
   scrollbar-width: thin;
-  scroll-behavior: smooth;
+  /* No smooth scrolling here: live following sets scrollTop several times a
+     second and animating each jump made the whole list shimmer. */
 }
 
 .transcript-list {
@@ -629,7 +630,10 @@ button {
   gap: 18px;
   padding: 15px 16px 17px 0;
   border-bottom: 1px solid var(--line);
-  animation: line-in 240ms ease both;
+}
+
+.transcript-line.is-new {
+  animation: line-in 220ms ease both;
 }
 
 .line-time {
@@ -648,7 +652,8 @@ button {
   border-left: 2px solid var(--paper-deep);
 }
 
-.transcript-line.is-new .line-content {
+.transcript-line.is-new .line-content,
+.transcript-line.is-latest .line-content {
   border-left-color: var(--gold);
 }
 
@@ -674,6 +679,7 @@ button {
 }
 
 .display-chinese .line-source,
+.display-dual .line-source,
 .display-english .line-translation {
   display: none;
 }
@@ -689,11 +695,25 @@ button {
 
 .interim-card {
   max-width: 920px;
+  min-height: 78px;
   margin: 17px auto 0;
   padding: 15px 18px 16px;
   border: 1px solid rgba(214, 167, 62, 0.34);
   background:
     linear-gradient(110deg, rgba(214, 167, 62, 0.1), rgba(251, 247, 236, 0.7));
+}
+
+.interim-card.is-idle .interim-label {
+  color: var(--muted);
+}
+
+.interim-card.is-idle #interimSource,
+.interim-card.is-idle #interimTranslation {
+  color: var(--muted);
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.6;
 }
 
 .interim-label {
