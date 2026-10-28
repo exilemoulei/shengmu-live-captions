@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildSrt,
+  isNoiseTranscript,
   lineNeedsTranslation,
   mergeCaptionLines,
   migrateLegacySettings,
@@ -12,7 +13,8 @@ import {
   sanitizeSettingsPatch,
   selectDisplayCaption,
   settingsForBroadcast,
-  shiftTimecode
+  shiftTimecode,
+  transcriptDuration
 } from "../extension/caption-utils.js";
 
 test("normalizeSettings defaults to DeepSeek API and validates its fields", () => {
@@ -147,6 +149,83 @@ test("normalizeCaptionLines keeps IDs stable and shifts display time", () => {
   assert.equal(normalized.lines[0].end, "0:00:18.25");
   assert.equal(normalized.lines[0].order, 17_000);
   assert.equal(normalized.lines[0].translationPending, false);
+});
+
+test("isNoiseTranscript drops short silent-source fragments but keeps real words", () => {
+  // Letterless pause fragments: decimal/clock shapes shorter than a spoken word.
+  assert.equal(isNoiseTranscript("7.8.", 0.4), true);
+  assert.equal(isNoiseTranscript("3.14", 0.9), true);
+  assert.equal(isNoiseTranscript("0:12", 1.2), true);
+  // Letterless symbols carry no text at all, whatever the duration.
+  for (const noise of ["...", "", "   ", "%$#", "-", "♪", "🎵"]) {
+    assert.equal(isNoiseTranscript(noise, 10), true, `expected noise: ${noise}`);
+  }
+  // Unknown duration is not evidence of noise: the line is kept.
+  for (const kept of ["7.8.", "3.14", "12:34"]) {
+    assert.equal(isNoiseTranscript(kept), false, `expected kept: ${kept}`);
+    assert.equal(isNoiseTranscript(kept, null), false, `expected kept: ${kept}`);
+    assert.equal(isNoiseTranscript(kept, 0), false, `expected kept: ${kept}`);
+    // A long line that happens to be a number is speech.
+    assert.equal(isNoiseTranscript(kept, 6), false, `expected speech: ${kept}`);
+  }
+  for (const real of [
+    "Yes.",
+    "No",
+    "你好",
+    "C3PO",
+    "Okay!",
+    // Plain integers are never dropped: only decimal and clock shapes are noise.
+    "42",
+    "1,024",
+    "2024",
+    "The raid starts at 7.8 seconds"
+  ]) {
+    assert.equal(isNoiseTranscript(real, 0.4), false, `expected speech: ${real}`);
+  }
+});
+
+test("transcriptDuration refuses missing or reversed timestamps", () => {
+  assert.equal(transcriptDuration({ start: "0:00:01.00", end: "0:00:03.50" }), 2.5);
+  assert.equal(transcriptDuration({ start: "0:00:03.00", end: "0:00:01.00" }), null);
+  assert.equal(transcriptDuration({ start: "0:00:03.00", end: "0:00:03.00" }), null);
+  assert.equal(transcriptDuration({}), null);
+  assert.equal(transcriptDuration(null), null);
+  // One-sided or unparsable timestamps are unknown, not "one second long".
+  assert.equal(transcriptDuration({ end: "0:00:01.00" }), null);
+  assert.equal(transcriptDuration({ start: "0:00:01.00" }), null);
+  assert.equal(transcriptDuration({ start: "abc", end: "0:00:02.00" }), null);
+  assert.equal(transcriptDuration({ start: "0:00:01.00", end: "garbage" }), null);
+  // Numeric seconds are accepted as well (parseTimecode supports both).
+  assert.equal(transcriptDuration({ start: 1, end: 3.5 }), 2.5);
+  assert.equal(transcriptDuration({ start: 1, end: Number.NaN }), null);
+});
+
+test("normalizeCaptionLines drops short noise lines and keeps untimed numbers", () => {
+  const normalized = normalizeCaptionLines(
+    {
+      lines: [
+        // 0.5 s of pause that the ASR rendered as a decimal.
+        { start: "0:00:01.00", end: "0:00:01.50", text: "7.8." },
+        // Same shape, but six seconds long: real speech, must survive.
+        { start: "0:00:03.00", end: "0:00:09.00", text: "3.14" },
+        // No timestamps at all, or only one side: unknown duration, never dropped.
+        { text: "7.8." },
+        { end: "0:00:09.50", text: "7.8." },
+        { start: "0:00:09.60", text: "7.8." },
+        { start: "0:00:10.00", end: "0:00:12.00", text: "Hello there." }
+      ],
+      buffer_transcription: "7.8.",
+      buffer_translation: ""
+    },
+    { sessionId: "session", epochId: "epoch-1", epochStartedAt: 1, sessionStartedAt: 1 }
+  );
+
+  assert.deepEqual(
+    normalized.lines.map((line) => line.source),
+    ["3.14", "7.8.", "7.8.", "7.8.", "Hello there."]
+  );
+  // Buffers have no duration, so a number-shaped buffer is kept as well.
+  assert.equal(normalized.bufferSource, "7.8.");
 });
 
 test("normalizeCaptionLines marks source-only lines as pending translation", () => {

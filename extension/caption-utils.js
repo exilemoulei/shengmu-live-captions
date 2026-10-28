@@ -160,6 +160,55 @@ export function cleanText(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
 }
 
+// A silent or noisy source still makes the ASR emit tiny non-words (a PoE run
+// produced a lone "7.8."). Such a fragment is short (it sits inside a pause),
+// so a letterless caption is dropped only when it is a decimal/clock shape and
+// the line itself is shorter than a spoken word: a 6-second line that transcribes
+// as "3.14" can be real speech and is kept. Captions made only of punctuation
+// or symbols ("...", "♪") carry no text at all and are always dropped.
+const DECIMAL_FRAGMENT = /^\d+(?:\.\d+)+\.*$/;
+const CLOCK_FRAGMENT = /^\d{1,2}:\d{2}(?:\.\d+)?$/;
+const SYMBOLS_ONLY = /^[\p{P}\p{S}]+$/u;
+const NOISE_MAX_DURATION_SECONDS = 1.5;
+// Same shape parseTimecode accepts. Both ends must be present and well formed:
+// parseTimecode maps anything unparsable to 0, so a missing start would
+// otherwise turn "the line ends at 1 s" into a 1-second (noise) duration.
+const TIMECODE_SHAPE = /^(?:\d+:)?\d{1,2}:\d{1,2}(?:\.\d+)?$/;
+
+// WhisperLiveKit serialises timestamps as "H:MM:SS.cc" strings, but a numeric
+// seconds value is accepted too. Anything else is unknown (null), never zero.
+function timecodeSeconds(value) {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? Math.max(0, value) : null;
+  }
+  const text = String(value ?? "").trim();
+  return TIMECODE_SHAPE.test(text) ? parseTimecode(text) : null;
+}
+
+/**
+ * Duration of an ASR line, or null when either timestamp is missing or out of
+ * order. null means "unknown" and must never be treated as "very short",
+ * otherwise a line without timecodes would be dropped as noise.
+ */
+export function transcriptDuration(line) {
+  const start = timecodeSeconds(line?.start);
+  const end = timecodeSeconds(line?.end);
+  if (start === null || end === null) return null;
+  return end > start ? end - start : null;
+}
+
+export function isNoiseTranscript(value, durationSeconds) {
+  const text = cleanText(value);
+  if (!text) return true;
+  if (/\p{L}/u.test(text)) return false;
+  if (SYMBOLS_ONLY.test(text)) return true;
+  if (!DECIMAL_FRAGMENT.test(text) && !CLOCK_FRAGMENT.test(text)) return false;
+  const duration = Number(durationSeconds);
+  // An unknown duration is not evidence of noise: keep the line.
+  if (!Number.isFinite(duration) || duration <= 0) return false;
+  return duration <= NOISE_MAX_DURATION_SECONDS;
+}
+
 export function getTranslationText(line) {
   const translation = line?.translation;
   if (typeof translation === "string") {
@@ -272,6 +321,9 @@ export function normalizeCaptionLines(data, options = {}) {
     const source = cleanText(line.text);
     const translation = getTranslationText(line);
     if (!source && !translation) continue;
+    if (source && isNoiseTranscript(source, transcriptDuration(line))) {
+      continue;
+    }
     const rawStart = String(line.start || "");
     const rawEnd = String(line.end || "");
     const start = shiftTimecode(rawStart, epochOffsetSeconds);
@@ -305,9 +357,11 @@ export function normalizeCaptionLines(data, options = {}) {
     }
   }
 
+  const bufferSource = cleanText(data?.buffer_transcription || data?.bufferSource);
+
   return {
     lines,
-    bufferSource: cleanText(data?.buffer_transcription || data?.bufferSource),
+    bufferSource: isNoiseTranscript(bufferSource) ? "" : bufferSource,
     bufferTranslation: cleanText(data?.buffer_translation || data?.bufferTranslation),
     translationError: cleanText(data?.translation_error || data?.translationError),
     status: data?.status || "active_transcription",

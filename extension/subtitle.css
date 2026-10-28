@@ -273,9 +273,12 @@ button {
 .session-list {
   display: grid;
   align-content: start;
+  grid-template-columns: minmax(0, 1fr);
   gap: 7px;
   min-height: 0;
   padding-right: 3px;
+  /* One long title used to widen the whole rail; clipped as a last resort. */
+  overflow-x: hidden;
   overflow-y: auto;
   scrollbar-color: rgba(245, 239, 223, 0.22) transparent;
   scrollbar-width: thin;
@@ -286,6 +289,7 @@ button {
   display: grid;
   gap: 6px;
   width: 100%;
+  min-width: 0;
   padding: 11px 11px 10px;
   border: 1px solid transparent;
   background: rgba(255, 255, 255, 0.035);
@@ -323,9 +327,11 @@ button {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
 }
 
 .session-card-head strong {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   font-size: 11px;
@@ -358,8 +364,17 @@ button {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  overflow: hidden;
   color: rgba(169, 185, 174, 0.76);
   font-size: 8px;
+}
+
+.session-card-foot > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mini-live {

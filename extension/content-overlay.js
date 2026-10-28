@@ -1,5 +1,5 @@
 (() => {
-  const OVERLAY_VERSION = 3;
+  const OVERLAY_VERSION = 4;
   const existing = globalThis.__shengmuCaptionOverlay;
   if (existing?.version === OVERLAY_VERSION && existing.refresh) {
     existing.refresh();
@@ -174,6 +174,11 @@
           gap: 2px;
         }
         .history-source {
+          display: block;
+          max-height: 1.4em;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
           color: rgba(255, 253, 244, 0.45);
           font-family: Georgia, "Times New Roman", serif;
           font-size: clamp(10px, calc(var(--translation-size) * 0.38), 20px);
@@ -181,6 +186,11 @@
           text-shadow: 0 1px 2px #000;
         }
         .history-translation {
+          display: -webkit-box;
+          max-height: 2.8em;
+          overflow: hidden;
+          -webkit-box-orient: vertical;
+          -webkit-line-clamp: 2;
           color: rgba(255, 253, 244, 0.8);
           font-family: "Noto Serif SC", "Songti SC", "SimSun", serif;
           font-size: clamp(12px, calc(var(--translation-size) * 0.6), 30px);
@@ -192,6 +202,13 @@
         .history-source:empty { display: none; }
         .caption-shell {
           position: relative;
+          display: flex;
+          flex-direction: column;
+          justify-content: flex-end;
+          /* With a large font on a short window the slots could still add up to
+             more than the viewport. Cap the shell and let the older slots
+             shrink first, so the current translation always stays readable. */
+          max-height: min(70vh, 680px);
           padding: 18px 22px 16px;
           overflow: hidden;
           border: 1px solid rgba(255, 249, 225, 0.16);
@@ -213,8 +230,43 @@
           background: linear-gradient(90deg, transparent, rgba(232, 184, 75, 0.65));
           content: "";
         }
-        .prev-translation {
+        /* One ASR segment can cover minutes of speech. Every caption slot is
+           therefore a tail-aligned window of N lines: the newest lines stay
+           visible, the overflow is clipped at the top and faded out, so an
+           oversized segment can no longer grow the box over the whole page. */
+        .prev-translation,
+        .source,
+        .translation {
           display: none;
+          flex-direction: column;
+          justify-content: flex-end;
+          overflow: hidden;
+        }
+        .prev-translation.visible,
+        .source.visible,
+        .translation.visible { display: flex; }
+        .caption-text {
+          display: block;
+          flex: none;
+          width: 100%;
+        }
+        .prev-translation,
+        .source {
+          flex: 0 3 auto;
+          min-height: 0;
+        }
+        .translation {
+          flex: 0 1 auto;
+          min-height: 0;
+        }
+        .prev-translation.overflowing,
+        .source.overflowing,
+        .translation.overflowing {
+          -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1.1em);
+          mask-image: linear-gradient(to bottom, transparent 0, #000 1.1em);
+        }
+        .prev-translation {
+          max-height: 2.68em;
           margin-bottom: 7px;
           color: rgba(255, 253, 244, 0.62);
           font-family: "Noto Serif SC", "Songti SC", "SimSun", serif;
@@ -226,9 +278,8 @@
           text-shadow: 0 1px 3px #000;
           white-space: pre-wrap;
         }
-        .prev-translation.visible { display: block; }
         .source {
-          display: none;
+          max-height: 2.8em;
           margin-bottom: 7px;
           color: rgba(255, 253, 244, 0.63);
           font-family: Georgia, "Times New Roman", serif;
@@ -238,8 +289,8 @@
           line-height: 1.38;
           text-shadow: 0 1px 2px #000;
         }
-        .source.visible { display: block; }
         .translation {
+          max-height: 4.14em;
           color: #fffdf4;
           font-family: "Noto Serif SC", "Songti SC", "SimSun", serif;
           font-size: var(--translation-size);
@@ -261,9 +312,6 @@
         .translation.failed {
           color: rgba(255, 186, 162, 0.9);
         }
-        .translation:empty,
-        .source:empty,
-        .prev-translation:empty { display: none; }
         .drag-handle {
           position: absolute;
           top: -9px;
@@ -398,9 +446,9 @@
           <div class="history-meta"></div>
         </div>
         <div class="caption-shell">
-          <div class="prev-translation"></div>
-          <div class="source"></div>
-          <div class="translation" role="status"></div>
+          <div class="prev-translation"><span class="caption-text"></span></div>
+          <div class="source"><span class="caption-text"></span></div>
+          <div class="translation" role="status"><span class="caption-text"></span></div>
           <div class="translation-error"></div>
         </div>
       </section>
@@ -531,7 +579,7 @@
   function bindWindowListeners() {
     if (windowListenersBound) return;
     windowListenersBound = true;
-    window.addEventListener("resize", applyStoredPosition);
+    window.addEventListener("resize", handleWindowResize);
     // The stage is pointer-events:none so it never blocks the player. Wheel
     // events are therefore caught here in the capture phase: only when the
     // pointer is over the caption box, and only while we actually consume the
@@ -618,9 +666,69 @@
     stage.style.setProperty("--translation-size", `${settings.fontSize}px`);
     stage.style.setProperty("--overlay-opacity", String(settings.opacity));
     modeButton.textContent = currentModeLabel();
-    const sourceVisible =
-      settings.displayMode === "bilingual" || settings.displayMode === "english";
-    sourceElement.classList.toggle("visible", sourceVisible);
+  }
+
+  // Overlay caption slots wrap their text in a span so the slot itself can be a
+  // fixed-height, bottom-aligned window: the span keeps its natural height and
+  // its top is clipped once the text runs past the cap.
+  function setCaptionText(element, text) {
+    const captionText = element.firstElementChild;
+    if (captionText && captionText.textContent !== text) {
+      captionText.textContent = text;
+    }
+    element.classList.toggle("visible", Boolean(text));
+  }
+
+  // The caption slots clip their overflow, so a long segment would silently
+  // lose its first lines. Fade the clipped edge instead of cutting it dry.
+  function markCaptionOverflow(...elements) {
+    for (const element of elements) {
+      if (!element || !element.classList.contains("visible")) {
+        element?.classList.remove("overflowing");
+        continue;
+      }
+      const captionText = element.firstElementChild;
+      const clipped =
+        Boolean(captionText) &&
+        element.clientHeight > 0 &&
+        captionText.getBoundingClientRect().height - element.clientHeight > 1;
+      element.classList.toggle("overflowing", clipped);
+    }
+  }
+
+  function refreshCaptionOverflow() {
+    markCaptionOverflow(previousElement, sourceElement, translationElement);
+  }
+
+  // A dragged position is stored as a viewport ratio, so a caption that grows
+  // later (an oversized ASR segment) can push the box past the bottom edge.
+  // Pull it back instead of leaving the newest lines off-screen.
+  function keepStageInViewport() {
+    if (!stage || stage.hidden || !stage.classList.contains("dragged")) return;
+    const rect = stage.getBoundingClientRect();
+    const overflowBottom = rect.bottom - window.innerHeight;
+    const overflowRight = rect.right - window.innerWidth;
+    if (overflowBottom > 0) {
+      const top = parseFloat(stage.style.top);
+      if (Number.isFinite(top)) {
+        stage.style.top = `${Math.max(0, Math.round(top - overflowBottom))}px`;
+      }
+    }
+    if (overflowRight > 0) {
+      const left = parseFloat(stage.style.left);
+      if (Number.isFinite(left)) {
+        stage.style.left = `${Math.max(0, Math.round(left - overflowRight))}px`;
+      }
+    }
+    if (overflowBottom > 0 || overflowRight > 0) {
+      stageRectCache = null;
+      historyRectCache = null;
+    }
+  }
+
+  function handleWindowResize() {
+    applyStoredPosition();
+    refreshCaptionOverflow();
   }
 
   function lineTranslation(line) {
@@ -932,22 +1040,23 @@
       settings.displayMode === "dual" && scrollBack === 0
         ? previousTranslation(caption)
         : "";
-    previousElement.textContent = previous;
-    previousElement.classList.toggle("visible", Boolean(previous));
+    setCaptionText(previousElement, previous);
 
     if (settings.displayMode === "english") {
-      sourceElement.textContent = "";
-      translationElement.textContent = caption.source;
+      setCaptionText(sourceElement, "");
+      setCaptionText(translationElement, caption.source);
       translationElement.classList.remove("pending", "failed");
     } else {
-      translationElement.textContent = caption.translation;
+      setCaptionText(translationElement, caption.translation);
       translationElement.classList.toggle(
         "pending",
         !caption.translation && !caption.failed
       );
       translationElement.classList.toggle("failed", Boolean(caption.failed));
-      sourceElement.textContent =
-        settings.displayMode === "bilingual" ? caption.source : "";
+      setCaptionText(
+        sourceElement,
+        settings.displayMode === "bilingual" ? caption.source : ""
+      );
     }
 
     const errorElement = shadow.querySelector(".translation-error");
@@ -956,6 +1065,8 @@
 
     // reveal first, then resolve a position that was requested while hidden
     if (positionPending) applyStoredPosition();
+    refreshCaptionOverflow();
+    keepStageInViewport();
     renderScrollback();
 
     if (!active) {
@@ -1042,7 +1153,7 @@
   function teardown() {
     if (windowListenersBound) {
       windowListenersBound = false;
-      window.removeEventListener("resize", applyStoredPosition);
+      window.removeEventListener("resize", handleWindowResize);
       window.removeEventListener("wheel", handleWheel, { capture: true });
       document.removeEventListener("fullscreenchange", handleFullscreenChange);
     }
