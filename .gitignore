@@ -5,3 +5,7 @@
 /.serena/
 /feiyu.test
 /scripts/local-service/server.pid
+/tests/
+/test-assets/
+/AGENTS.md
+/paseo/
