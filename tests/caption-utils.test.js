@@ -31,6 +31,33 @@ test("normalizeSettings defaults to DeepSeek API and validates its fields", () =
   });
 });
 
+test("local model selection defaults to 9B/large-v3-turbo and rejects unknown ids", () => {
+  const defaults = normalizeSettings({});
+  assert.equal(defaults.localTranslationModel, "9b-q4km");
+  assert.equal(defaults.localAsrModel, "large-v3-turbo");
+
+  const picked = normalizeSettings({
+    localTranslationModel: "2b-iq4xs",
+    localAsrModel: "medium"
+  });
+  assert.equal(picked.localTranslationModel, "2b-iq4xs");
+  assert.equal(picked.localAsrModel, "medium");
+
+  const invalid = normalizeSettings({
+    localTranslationModel: "../../evil.gguf",
+    localAsrModel: "whisper-huge"
+  });
+  assert.equal(invalid.localTranslationModel, "9b-q4km");
+  assert.equal(invalid.localAsrModel, "large-v3-turbo");
+
+  // The popup reads settings back through the broadcast helper.
+  assert.equal(
+    settingsForBroadcast({ localTranslationModel: "2b-iq4xs" })
+      .localTranslationModel,
+    "2b-iq4xs"
+  );
+});
+
 test("display mode keeps the dual-line translation option", () => {
   assert.equal(normalizeSettings({ displayMode: "dual" }).displayMode, "dual");
   assert.equal(

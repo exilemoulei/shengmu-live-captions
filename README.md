@@ -30,6 +30,35 @@ Set-Location -LiteralPath '<项目目录>'
 
 `Start-DevBrowser.ps1` 使用项目专用 Chrome 配置目录 `chrome-profile`，与日常 Chrome 配置隔离。首次启动可自行登录需要账号的站点。
 
+### 从控制面板一键启动本地模型（0.5.0 起）
+
+扩展页面不能直接创建本地进程，所以新增了一个本地控制服务代为执行。先启动控制服务：
+
+```powershell
+.\scripts\Start-LocalService.ps1
+```
+
+之后打开扩展控制面板（`Ctrl+Shift+Y`），“本地模型”区块会显示 ASR 与本地翻译服务的实时状态：
+
+- **状态**：ASR / 翻译是否在线、当前翻译模型名、控制服务连接状态。
+- **一键启动**：按所选档位拉起 WhisperLiveKit（8010）和 llama.cpp 翻译服务（8013）；切档位时会自动重启不匹配的旧服务。
+- **停止**：只停本项目自己的两个服务进程。
+- **翻译模型**：`Index-Translate-9B Q4_K_M`（质量最好，约 5.4 GiB）或 `Index-Translate-2B IQ4_XS`（约 1.15 GiB，省显存）。
+- **ASR 模型**：`large-v3-turbo`（默认）或 `medium`（更快更省显存，首次使用会自动从 Hugging Face 下载约 1.5 GB）。
+- **模型缺失**：卡片会给出 Hugging Face 下载页链接和“下载模型”按钮，由本地控制服务后台下载并显示进度；也可以手动下载后放到提示的路径。
+
+控制服务只监听 `127.0.0.1:8014`，并拒绝来源不是 `chrome-extension://` 的浏览器请求。但它不提供额外鉴权：本机任何进程（包括命令行）都可以直接调用这几个接口，安全性依赖本机账户边界。停止控制服务：
+
+```powershell
+.\scripts\Stop-LocalService.ps1
+```
+
+不启动控制服务也可以直接用 `Start-Services.ps1`，并可用参数指定档位：
+
+```powershell
+.\scripts\Start-Services.ps1 -TranslationModel 2b-iq4xs -AsrModel medium
+```
+
 ### 翻译引擎
 
 新安装默认使用 DeepSeek API 翻译。打开扩展控制面板，在“翻译引擎”中填入 DeepSeek API Key 后即可开始；Key 只保存在本机扩展存储中，不会同步，也不会发送给网页内容脚本。切换到其他服务商时，各服务商的 Key 会分别保存。Key 以明文形式存放在扩展本地存储中，依赖 Windows 账户与 Chrome 配置目录的访问控制；共用电脑上建议使用临时 Key 或本地服务端。
@@ -100,6 +129,8 @@ v0.3.2 使用本地 TARGET 音频完成了一次 60 秒 Chrome 端到端验证�
 v0.4.0 的翻译 API 客户端由 `tests/translation-api.test.js` 使用本地 OpenAI 兼容 mock 服务覆盖：请求构造、DeepSeek thinking 关闭与 400 重试、鉴权/余额/限流/超时错误、JSON 解析、用量统计。2026-10-27 使用 0.5 发布会的 2 分钟切片做了一次真实 DeepSeek 端到端验证：Chrome + WhisperLiveKit ASR-only + DeepSeek API，31 条字幕、最终缺译 0、无 fallback、捕获比中位 `0.999976`、99 次请求 / 23,700 prompt tokens + 929 completion tokens、GPU 峰值 6,479 MiB；浮层和历史窗口截图见 `paseo/evidence/`。全量发布会因 token 成本不跑，长时稳定性和本地服务端回归留待需要时再验。
 
 v0.4.3 修掉三个已知问题：超长 ASR 句会把浮层铺满屏幕、记录页场次列表长标题出横向滚动条、静音时的极短碎片行。验证：`npm test` 53 项全过；无服务 CDP 冒烟 `.research/ui-smoke-043.py` 8 项全过（正常单行不溢出、超长句译文限 3 行/原文限 2 行且顶部渐隐、字幕框高度 < 视口 45%、浮层历史行译文 2 行原文 1 行、短句回来时渐隐清除、拖动过的浮层被长句顶高后自动拉回视口、520px 高窗口 + 64px 字号下整块浮层仍在视口内）；0.4.2 冒烟 `.research/ui-smoke-042.py` 12 项回归全过；真实 WhisperLiveKit（`-AsrOnly`）对 2 分钟 PoE 切片的 134 条唯一转写过噪声规则，误杀 0。截图见 `paseo/evidence/v043-*.png`，细节见 `paseo/07-ui-fixes-0.4.3.md`。
+
+v0.5.0 增加本地模型一键启动：控制面板新增“本地模型”区块（状态、一键启动/停止、翻译模型与 ASR 尺寸下拉、模型下载）。验证：`npm test` 54 项全过；控制服务接口实测（`/health`、`/status`、`/models`、`/start`、`/stop`、`/download`、CORS 预检、`Origin: https://...` 与 `sec-fetch-site: cross-site` 均返回 403）；真实下载 2B IQ4_XS（1,234,377,216 字节，进度与最终大小一致）；真实一键启动 2B + large-v3-turbo 共 22 秒就绪、切到 9B 耗时 19 秒、`/stop` 后两端口释放；启动中点停止后状态稳定在 `idle`；2B 模型真实翻译通过；ASR `medium` 首次下载被 Hugging Face Xet 传输卡死（600 秒超时、缓存停在 439 MB），设置 `HF_HUB_DISABLE_XET=1` 后 63 秒下完 1.5 GB，随后一键启动 21 秒就绪且真实转写通过；控制面板在线/离线/模型缺失三种状态经 CDP 检查与截图（`paseo/evidence/v050-local-model-*.png`），细节见 `paseo/08-local-model-0.5.0.md`。
 
 v0.4.2 的评审问题修复用无服务的 CDP 冒烟脚本验证（专用 Chrome 9223 + 未打包扩展，向内容脚本注入伪造 `caption-state`）：12 项全部通过——历史面板 12 条、晚到译文原地刷新、新行不顶动阅读位置、滚回实时不带动网页、关闭后滚轮恢复滚动网页、重新注入后仍只有一个浮层且一格滚轮只走一行、拖拽（含面板打开时）与窗口缩放后命中区域跟随、历史日志封顶 60 条、回看期间新增 40 行后冻结行不消失。截图见 `paseo/evidence/v042-overlay-history-open.png` 与 `v042-overlay-history-closed.png`；细节见 `paseo/06-review-fixes-0.4.2.md`。真实 ASR/翻译链路的 240 秒采集回归本轮未重跑。
 

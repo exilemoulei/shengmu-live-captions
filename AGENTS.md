@@ -4,9 +4,9 @@
 
 声幕 (Shengmu) 是一个 Chrome MV3 扩展，捕获当前标签页的英文音频，通过本地 WhisperLiveKit 实时识别，再由 DeepSeek API 或本地 Index-Translate-9B 翻译成中文，以浮层字幕和历史记录窗口的形式呈现。所有处理在本机完成。
 
-- **当前版本**：0.4.3（`package.json` 与 `extension/manifest.json` 同步维护）
+- **当前版本**：0.5.0（`package.json` 与 `extension/manifest.json` 同步维护）
 - **运行环境**：Windows 11，PowerShell 7，Chrome，NVIDIA GPU
-- **服务端口**：WhisperLiveKit `8010`、翻译服务 `8013`、Chrome DevTools `9223`
+- **服务端口**：WhisperLiveKit `8010`、翻译服务 `8013`、本地控制服务 `8014`、Chrome DevTools `9223`
 
 ## 架构与模块
 
@@ -35,7 +35,7 @@ Chrome tabCapture
 | `translation-api.js` | 670 | 翻译 API 客户端：DeepSeek/OpenAI/本地服务端三种 provider、鉴权错误处理、400 重试、用量统计 |
 | `offscreen.js` | 592 | offscreen document：维持 WebSocket 长连接（service worker 休眠时不断线） |
 | `caption-utils.js` | 482 | 纯函数工具：字幕合并、显示模式选择、设置归一化与迁移、静音碎片行过滤 |
-| `popup.js` | 481 | 扩展弹出面板：启动/停止、翻译引擎配置、API Key 管理 |
+| `popup.js` | 902 | 扩展弹出面板：启动/停止、翻译引擎配置、API Key 管理、本地模型状态与一键启动 |
 | `history-db.js` | 181 | IndexedDB 封装：字幕与场次的读写 |
 | `history-write-queue.js` | 113 | 历史写入串行化：失败批次保留并自动重试，防止旧写入覆盖新译文 |
 | `overlay-history.js` | 94 | 浮层历史回看：增量合并、晚到译文原地刷新、上限裁剪 |
@@ -45,8 +45,9 @@ Chrome tabCapture
 
 | 目录 | 说明 |
 |------|------|
-| `tests/` | 6 个 Node.js 内置 test runner 测试文件，覆盖纯函数、队列、渲染、翻译 API |
-| `scripts/` | PowerShell 脚本：启动/停止服务、启动开发浏览器、加载扩展 |
+| `tests/` | 6 个 Node.js 内置 test runner 测试文件（54 项），覆盖纯函数、队列、渲染、翻译 API、本地模型设置 |
+| `scripts/` | PowerShell 脚本：启动/停止服务、启动/停止本地控制服务、启动开发浏览器、加载扩展 |
+| `scripts/local-service/` | 本地控制服务（`server.mjs`，Node 原生 http，`127.0.0.1:8014`）：给控制面板提供状态查询、一键启动/停止、模型列表与下载 |
 | `paseo/` | Paseo 代理会话记录与评审证据 |
 | `chrome-profile/` | 专用 Chrome 配置目录（与日常 Chrome 隔离） |
 | `.research/` | 研究脚本、测试产物、WhisperLiveKit 源码与虚拟环境 |
@@ -64,6 +65,9 @@ Chrome tabCapture
 ```powershell
 # 1. 启动本地服务（WhisperLiveKit + 翻译）
 .\scripts\Start-Services.ps1
+
+# 1b. 或启动本地控制服务，用扩展控制面板一键启动模型（0.5.0 起）
+.\scripts\Start-LocalService.ps1
 
 # 2. 仅做 ASR（不启动翻译模型，节省显存，用 DeepSeek API 翻译）
 .\scripts\Start-Services.ps1 -AsrOnly
@@ -98,6 +102,9 @@ Get-ChildItem -LiteralPath .\extension -Filter *.js |
 | `-TranslateOnComplete` | 关 | 整句完成后再翻译（减少回退闪烁，但中文更晚出现） |
 | `-PauseSegmentationSeconds` | 1.0 | ASR 静音切分阈值 |
 | `-Glossary` | 空 | 术语表文件路径 |
+| `-TranslationModel` | `9b-q4km` | 本地翻译模型档位：`9b-q4km` / `2b-iq4xs` |
+| `-TranslationModelPath` | 空 | 自定义 GGUF 路径（填了则忽略 `-TranslationModel`） |
+| `-AsrModel` | `large-v3-turbo` | faster-whisper 模型尺寸，控制面板可选 `large-v3-turbo` / `medium` |
 
 ## 端到端验证
 
@@ -173,6 +180,16 @@ Get-ChildItem -LiteralPath .\extension -Filter *.js |
 - **显存管理**：`-AsrOnly` 模式不加载翻译模型，节省显存，适合配合 DeepSeek API 使用。翻译模型（Index-Translate-9B）占用显著显存。
 - **端口占用**：`Stop-Services.ps1` 只停止本项目的进程（匹配命令行中的端口和路径），不会误停其他程序。如果端口仍被占用会输出警告。
 
+### 本地控制服务（0.5.0 起）
+
+- 扩展页面不能创建本地进程，因此 popup 的“一键启动”通过 `127.0.0.1:8014` 的本地控制服务代劳；未启动控制服务时 popup 会显示可复制的启动命令，功能不受影响（仍可用 `Start-Services.ps1`）。
+- 控制服务只绑定回环地址，并且只接受 `origin` 以 `chrome-extension://` 开头的请求（无 `origin` 的 curl/PowerShell 调用也允许），普通网页的跨域请求返回 403。
+- 启动逻辑不重复实现：`/start` 调 `scripts/Start-Services.ps1`，`/stop` 调 `scripts/Stop-Services.ps1`。改启动参数要去改那两个脚本。
+- 翻译模型档位映射（id → alias → GGUF 路径）同时存在于 `server.mjs`、`Start-Services.ps1` 和 `caption-utils.js` 的枚举里，改档位必须三处同步。
+- 模型下载用系统 `C:\Windows\System32\curl.exe`，跟随 `HTTPS_PROXY` 环境变量（本机为 `127.0.0.1:7897`）；下载先写 `.part` 再改名，体积校验以 HEAD 得到的 `content-length` 为准。
+- ASR 模型（faster-whisper）由 WhisperLiveKit 自己从 Hugging Face 下载。本机代理下 HF 的 Xet 传输会卡死（实测 600 秒只下到 439 MB 就不动了），`Start-Services.ps1` 启动 WLK 前会设 `HF_HUB_DISABLE_XET=1` 改走普通 HTTP（实测 1.5 GB / 63 秒）。手动跑 whisperlivekit-server 时也要带这个环境变量。
+- WLK 就绪等待已从 180 秒提到 600 秒，因为首次使用未缓存的 ASR 模型需要下载；翻译模型（llama.cpp）仍是 120 秒。
+
 ### 扩展行为
 
 - **浮层滚轮回看**：进入历史回看后，面板锁定当时的行集合与顺序（条目快照），新到达的字幕不会插入。收起后回到实时，最新字幕照常进入。
@@ -187,6 +204,7 @@ Get-ChildItem -LiteralPath .\extension -Filter *.js |
 | 扩展源码 | `extension/` |
 | 单元测试 | `tests/*.test.js` |
 | 启动脚本 | `scripts/Start-Services.ps1` |
+| 本地控制服务 | `scripts/local-service/server.mjs`（`scripts/Start-LocalService.ps1`） |
 | 开发浏览器 | `scripts/Start-DevBrowser.ps1` |
 | 研究脚本 | `.research/*.py` |
 | CDP 冒烟 | `.research/ui-smoke-*.py` |

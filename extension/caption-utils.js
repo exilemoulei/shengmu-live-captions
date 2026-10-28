@@ -9,6 +9,11 @@ export const SETTINGS_KEY = "settings";
 export const RUNTIME_STATE_KEY = "runtimeState";
 export const HISTORY_CHANGED_KEY = "historyRevision";
 
+// Local model ids must match .research/local-service/server.mjs and the
+// presets in scripts/Start-Services.ps1.
+export const LOCAL_TRANSLATION_MODELS = Object.freeze(["9b-q4km", "2b-iq4xs"]);
+export const LOCAL_ASR_MODELS = Object.freeze(["large-v3-turbo", "medium"]);
+
 export const DEFAULT_SETTINGS = Object.freeze({
   wsUrl: "ws://127.0.0.1:8010/asr?target_language=zh",
   displayMode: "bilingual",
@@ -17,6 +22,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
   overlayEnabled: true,
   openPanelOnStart: true,
   autoScroll: true,
+  localTranslationModel: "9b-q4km",
+  localAsrModel: "large-v3-turbo",
   translationMode: DEFAULT_TRANSLATION_MODE,
   translationProvider: DEFAULT_TRANSLATION_PROVIDER,
   translationBaseUrl: "https://api.deepseek.com/v1",
@@ -95,6 +102,14 @@ export function normalizeSettings(value = {}) {
     overlayEnabled: value.overlayEnabled !== false,
     openPanelOnStart: value.openPanelOnStart !== false,
     autoScroll: value.autoScroll !== false,
+    localTranslationModel: LOCAL_TRANSLATION_MODELS.includes(
+      value.localTranslationModel
+    )
+      ? value.localTranslationModel
+      : DEFAULT_SETTINGS.localTranslationModel,
+    localAsrModel: LOCAL_ASR_MODELS.includes(value.localAsrModel)
+      ? value.localAsrModel
+      : DEFAULT_SETTINGS.localAsrModel,
     translationMode: translation.mode,
     translationProvider: translation.provider,
     translationBaseUrl: translation.baseUrl,

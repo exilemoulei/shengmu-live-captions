@@ -39,6 +39,56 @@
 
       <p id="errorMessage" class="error-message" role="alert" hidden></p>
 
+      <section class="local-model" aria-label="本地模型">
+        <div class="local-model-head">
+          <p class="eyebrow">本地模型</p>
+          <span id="localServiceBadge" class="local-badge">检测中</span>
+        </div>
+        <div class="local-status">
+          <span>
+            <b>ASR</b>
+            <i id="localAsrState" class="local-state">未连接</i>
+          </span>
+          <span>
+            <b>翻译</b>
+            <i id="localTranslationState" class="local-state">未连接</i>
+          </span>
+        </div>
+        <div class="control-row">
+          <label for="localTranslationModel">翻译模型</label>
+          <select id="localTranslationModel"></select>
+        </div>
+        <div class="control-row">
+          <label for="localAsrModel">ASR 模型</label>
+          <select id="localAsrModel"></select>
+        </div>
+        <p id="localModelHint" class="field-hint"></p>
+        <div id="localMissingBox" class="local-missing" hidden>
+          <p id="localMissingText"></p>
+          <div class="button-row">
+            <a id="localDownloadPage" class="outline-button" target="_blank" rel="noreferrer">下载页</a>
+            <button id="localDownloadButton" class="outline-button" type="button">下载模型</button>
+          </div>
+          <div id="localProgress" class="local-progress" hidden>
+            <i id="localProgressBar"></i>
+          </div>
+          <p id="localProgressText" class="field-hint" hidden></p>
+        </div>
+        <div class="button-row">
+          <button id="localStartButton" class="outline-button" type="button">一键启动</button>
+          <button id="localStopButton" class="outline-button" type="button" disabled>停止</button>
+        </div>
+        <p id="localJobMessage" class="field-hint" hidden></p>
+        <div id="localServiceOffline" class="local-offline" hidden>
+          <p>本地控制服务未运行，在项目目录执行下面命令后点“重新检测”：</p>
+          <code id="localServiceCommand"></code>
+          <div class="button-row">
+            <button id="copyLocalServiceCommand" class="outline-button" type="button">复制命令</button>
+            <button id="retryLocalService" class="outline-button" type="button">重新检测</button>
+          </div>
+        </div>
+      </section>
+
       <section class="controls" aria-label="字幕显示设置">
         <div class="control-row">
           <label for="displayMode">显示</label>

@@ -42,14 +42,58 @@ const elements = {
   translationTestResult: document.querySelector("#translationTestResult"),
   translationUsage: document.querySelector("#translationUsage"),
   openMonitor: document.querySelector("#openMonitor"),
-  openMonitorFooter: document.querySelector("#openMonitorFooter")
+  openMonitorFooter: document.querySelector("#openMonitorFooter"),
+  localServiceBadge: document.querySelector("#localServiceBadge"),
+  localAsrState: document.querySelector("#localAsrState"),
+  localTranslationState: document.querySelector("#localTranslationState"),
+  localTranslationModel: document.querySelector("#localTranslationModel"),
+  localAsrModel: document.querySelector("#localAsrModel"),
+  localModelHint: document.querySelector("#localModelHint"),
+  localMissingBox: document.querySelector("#localMissingBox"),
+  localMissingText: document.querySelector("#localMissingText"),
+  localDownloadPage: document.querySelector("#localDownloadPage"),
+  localDownloadButton: document.querySelector("#localDownloadButton"),
+  localProgress: document.querySelector("#localProgress"),
+  localProgressBar: document.querySelector("#localProgressBar"),
+  localProgressText: document.querySelector("#localProgressText"),
+  localStartButton: document.querySelector("#localStartButton"),
+  localStopButton: document.querySelector("#localStopButton"),
+  localJobMessage: document.querySelector("#localJobMessage"),
+  localServiceOffline: document.querySelector("#localServiceOffline"),
+  localServiceCommand: document.querySelector("#localServiceCommand"),
+  copyLocalServiceCommand: document.querySelector("#copyLocalServiceCommand"),
+  retryLocalService: document.querySelector("#retryLocalService")
 };
+
+const LOCAL_SERVICE_URL = "http://127.0.0.1:8014";
+const LOCAL_SERVICE_COMMAND =
+  "powershell -ExecutionPolicy Bypass -File .\\scripts\\Start-LocalService.ps1";
+const LOCAL_POLL_MS = 2500;
 
 let activeTab = null;
 let runtimeState = null;
 let settings = normalizeSettings(DEFAULT_SETTINGS);
 let busy = false;
 let fontSaveTimer = null;
+let localPollTimer = null;
+
+// Local model control plane. Mirrors what `.research/local-service/server.mjs`
+// reports; nothing here creates processes itself.
+const local = {
+  serviceOnline: false,
+  models: null,
+  status: null,
+  busy: false,
+  notice: "",
+  noticeAt: 0
+};
+
+const LOCAL_NOTICE_TTL_MS = 15000;
+
+function setLocalNotice(text) {
+  local.notice = text || "";
+  local.noticeAt = Date.now();
+}
 
 function setError(message = "") {
   elements.errorMessage.textContent = message;
@@ -177,6 +221,351 @@ function renderTranslationSettings() {
     usageText += ` · ${String(translationState.error).slice(0, 90)}`;
   }
   elements.translationUsage.textContent = usageText;
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`;
+  if (value >= 1024 ** 2) return `${Math.round(value / 1024 ** 2)} MB`;
+  return `${Math.round(value / 1024)} KB`;
+}
+
+async function localRequest(path, { timeoutMs = 6000, ...init } = {}) {
+  const response = await fetch(`${LOCAL_SERVICE_URL}${path}`, {
+    ...init,
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (!response.ok || payload?.ok === false) {
+    const error = new Error(
+      payload?.error || `本地控制服务返回 HTTP ${response.status}`
+    );
+    error.payload = payload;
+    throw error;
+  }
+  return payload;
+}
+
+function selectedLocalTranslation() {
+  return (local.models?.translation || []).find(
+    (model) => model.id === settings.localTranslationModel
+  );
+}
+
+function selectedLocalAsr() {
+  return (local.models?.asr || []).find(
+    (model) => model.id === settings.localAsrModel
+  );
+}
+
+let localSelectsSignature = "";
+
+function syncModelSelects() {
+  const signature = local.serviceOnline
+    ? JSON.stringify([
+        (local.models?.translation || []).map((model) => [
+          model.id,
+          model.label,
+          model.exists,
+          model.note
+        ]),
+        (local.models?.asr || []).map((model) => [
+          model.id,
+          model.label,
+          model.cached
+        ])
+      ])
+    : "offline";
+  if (signature !== localSelectsSignature) {
+    localSelectsSignature = signature;
+    const fallback = local.serviceOnline ? "没有可用模型" : "控制服务未连接";
+    fillModelSelect(
+      elements.localTranslationModel,
+      local.models?.translation || [],
+      settings.localTranslationModel,
+      fallback
+    );
+    fillModelSelect(
+      elements.localAsrModel,
+      local.models?.asr || [],
+      settings.localAsrModel,
+      fallback
+    );
+  }
+  elements.localTranslationModel.disabled = !local.serviceOnline;
+  elements.localAsrModel.disabled = !local.serviceOnline;
+}
+
+function fillModelSelect(select, entries, selectedId, fallbackLabel) {
+  const options = entries.map((entry) => {
+    const option = document.createElement("option");
+    option.value = entry.id;
+    option.textContent = entry.label;
+    return option;
+  });
+  if (!options.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = fallbackLabel;
+    options.push(option);
+  }
+  select.replaceChildren(...options);
+  const values = options.map((option) => option.value);
+  select.value = values.includes(selectedId) ? selectedId : values[0] || "";
+}
+
+function renderLocal() {
+  const status = local.status;
+  const job = status?.job || null;
+  const services = status?.services || null;
+  const translationModel = selectedLocalTranslation();
+  const asrModel = selectedLocalAsr();
+  const download = status?.download || null;
+  const activeDownload =
+    download && download.modelId === settings.localTranslationModel
+      ? download
+      : null;
+  const jobRunning = job?.state === "starting" || job?.state === "stopping";
+
+  let badgeLabel = "控制服务未连接";
+  let badgeClass = "warning";
+  if (local.serviceOnline) {
+    if (job?.state === "starting") {
+      badgeLabel = "启动中";
+      badgeClass = "warning";
+    } else if (job?.state === "error") {
+      badgeLabel = "启动失败";
+      badgeClass = "warning";
+    } else if (services?.translation?.online && services?.asr?.online) {
+      badgeLabel = "全部在线";
+      badgeClass = "online";
+    } else {
+      badgeLabel = "控制服务已连接";
+      badgeClass = "";
+    }
+  }
+  elements.localServiceBadge.textContent = badgeLabel;
+  elements.localServiceBadge.className = `local-badge ${badgeClass}`.trim();
+
+  const asrOnline = Boolean(services?.asr?.online);
+  elements.localAsrState.textContent = asrOnline
+    ? `在线 · ${services.asr.port}`
+    : jobRunning
+      ? "启动中…"
+      : "未连接";
+  elements.localAsrState.className = `local-state ${
+    asrOnline ? "online" : jobRunning ? "" : "warning"
+  }`.trim();
+
+  const translationOnline = Boolean(services?.translation?.online);
+  elements.localTranslationState.textContent = translationOnline
+    ? `在线 · ${services.translation.model || "已就绪"}`
+    : jobRunning
+      ? "启动中…"
+      : "未连接";
+  elements.localTranslationState.className = `local-state ${
+    translationOnline ? "online" : jobRunning ? "" : "warning"
+  }`.trim();
+
+  syncModelSelects();
+
+  let hint = "";
+  if (!local.serviceOnline) {
+    hint = "启动本地控制服务后，可以在这里一键拉起 ASR 与本地翻译模型。";
+  } else if (translationModel) {
+    hint = translationModel.exists
+      ? `翻译模型已就绪：${formatBytes(translationModel.bytes)}`
+      : `翻译模型未下载：${translationModel.file}`;
+    if (asrModel) {
+      hint += asrModel.cached
+        ? `；ASR ${asrModel.label} 已缓存`
+        : `；ASR ${asrModel.label} 首次启动会自动下载（${asrModel.sizeLabel}）`;
+    }
+    const runningModel = services?.translation?.online
+      ? services.translation.model
+      : "";
+    if (runningModel && runningModel !== translationModel.alias) {
+      hint += `；当前运行 ${runningModel}，点“一键启动”会切换到所选模型`;
+    }
+  }
+  elements.localModelHint.textContent = hint;
+
+  const needsDownload = Boolean(
+    local.serviceOnline && translationModel && !translationModel.exists
+  );
+  elements.localMissingBox.hidden = !needsDownload;
+  if (needsDownload) {
+    elements.localMissingText.textContent =
+      `本地未找到 ${translationModel.file}（${translationModel.note}）。` +
+      "可以点“下载模型”由本地服务代下，或从下载页手动获取后放到 " +
+      `${translationModel.path}`;
+    elements.localDownloadPage.href = translationModel.pageUrl;
+    elements.localDownloadButton.textContent = `下载 ${formatBytes(
+      translationModel.bytes
+    )}`;
+    elements.localDownloadButton.disabled =
+      local.busy || activeDownload?.state === "downloading";
+  }
+
+  // Progress is only meaningful while a download is running or after it
+  // failed. A stale "done" snapshot must not hide a deleted model file.
+  const downloading = activeDownload?.state === "downloading";
+  const downloadError =
+    activeDownload?.state === "error" && !translationModel?.exists;
+  if (downloading) {
+    const total = activeDownload.totalBytes || 0;
+    const ratio =
+      total > 0
+        ? Math.min(1, activeDownload.receivedBytes / total)
+        : 0;
+    elements.localProgress.hidden = false;
+    elements.localProgressBar.style.width = `${(ratio * 100).toFixed(1)}%`;
+    elements.localProgressText.hidden = false;
+    elements.localProgressText.textContent = `${formatBytes(
+      activeDownload.receivedBytes
+    )} / ${total > 0 ? formatBytes(total) : "未知大小"}（${Math.round(
+      ratio * 100
+    )}%）`;
+  } else {
+    elements.localProgress.hidden = true;
+    elements.localProgressBar.style.width = "0";
+    elements.localProgressText.hidden = !downloadError;
+    if (downloadError) {
+      elements.localProgressText.textContent = `下载失败：${activeDownload.error}`;
+    }
+  }
+
+  let message = local.notice;
+  if (message && Date.now() - local.noticeAt > LOCAL_NOTICE_TTL_MS) {
+    local.notice = "";
+    message = "";
+  }
+  if (!message && job?.message) {
+    message = job.message;
+    if (job.state === "starting" && job.startedAt) {
+      message += `（${Math.round((Date.now() - job.startedAt) / 1000)} 秒）`;
+    }
+    if (job.state === "error") message = `启动失败：${job.message}`;
+  }
+  elements.localJobMessage.textContent = message;
+  elements.localJobMessage.hidden = !message;
+
+  elements.localStartButton.disabled =
+    !local.serviceOnline ||
+    local.busy ||
+    jobRunning ||
+    downloading ||
+    !translationModel?.exists ||
+    !asrModel;
+  const anyServiceOnline = Boolean(
+    services?.asr?.online || services?.translation?.online
+  );
+  elements.localStopButton.disabled =
+    !local.serviceOnline ||
+    local.busy ||
+    job?.state === "stopping" ||
+    downloading ||
+    (!anyServiceOnline && job?.state !== "starting");
+
+  elements.localServiceOffline.hidden = local.serviceOnline;
+  elements.localServiceCommand.textContent = LOCAL_SERVICE_COMMAND;
+}
+
+let localPolling = false;
+
+async function pollLocal() {
+  if (localPolling) return;
+  localPolling = true;
+  try {
+    const modelsPayload = await localRequest("/models", { timeoutMs: 2500 });
+    local.models = modelsPayload.models;
+    local.serviceOnline = true;
+    local.status = await localRequest("/status", { timeoutMs: 5000 });
+  } catch {
+    local.serviceOnline = false;
+    local.models = null;
+    local.status = null;
+  } finally {
+    localPolling = false;
+  }
+  renderLocal();
+}
+
+async function startLocalServices() {
+  if (local.busy) return;
+  local.busy = true;
+  setLocalNotice("");
+  renderLocal();
+  try {
+    const payload = await localRequest("/start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        translationModel: settings.localTranslationModel,
+        asrModel: settings.localAsrModel
+      }),
+      timeoutMs: 15000
+    });
+    local.status = { ...(local.status || {}), job: payload.job };
+    setLocalNotice(payload.job?.message || "已开始启动本地服务");
+  } catch (error) {
+    setLocalNotice(`启动失败：${error.message}`);
+  } finally {
+    local.busy = false;
+    await pollLocal();
+  }
+}
+
+async function stopLocalServices() {
+  if (local.busy) return;
+  local.busy = true;
+  setLocalNotice("");
+  renderLocal();
+  try {
+    await localRequest("/stop", { method: "POST", timeoutMs: 20000 });
+    setLocalNotice("已停止本地服务");
+  } catch (error) {
+    setLocalNotice(`停止失败：${error.message}`);
+  } finally {
+    local.busy = false;
+    await pollLocal();
+  }
+}
+
+async function downloadLocalModel() {
+  if (local.busy) return;
+  local.busy = true;
+  setLocalNotice("");
+  renderLocal();
+  try {
+    await localRequest("/download", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ translationModel: settings.localTranslationModel }),
+      timeoutMs: 20000
+    });
+    setLocalNotice("已开始下载模型");
+  } catch (error) {
+    setLocalNotice(`下载失败：${error.message}`);
+  } finally {
+    local.busy = false;
+    await pollLocal();
+  }
+}
+
+async function copyLocalServiceCommand() {
+  try {
+    await navigator.clipboard.writeText(LOCAL_SERVICE_COMMAND);
+    setLocalNotice("启动命令已复制");
+  } catch (error) {
+    setLocalNotice(`复制失败：${error.message}`);
+  }
+  renderLocal();
 }
 
 async function refresh() {
@@ -465,6 +854,43 @@ function openMonitor() {
 elements.openMonitor.addEventListener("click", openMonitor);
 elements.openMonitorFooter.addEventListener("click", openMonitor);
 
+elements.localTranslationModel.addEventListener("change", () => {
+  if (!elements.localTranslationModel.value) return;
+  void savePatch({
+    localTranslationModel: elements.localTranslationModel.value
+  })
+    .then(() => renderLocal())
+    .catch((error) => setError(error.message));
+});
+
+elements.localAsrModel.addEventListener("change", () => {
+  if (!elements.localAsrModel.value) return;
+  void savePatch({ localAsrModel: elements.localAsrModel.value })
+    .then(() => renderLocal())
+    .catch((error) => setError(error.message));
+});
+
+elements.localStartButton.addEventListener("click", () => {
+  void startLocalServices();
+});
+
+elements.localStopButton.addEventListener("click", () => {
+  void stopLocalServices();
+});
+
+elements.localDownloadButton.addEventListener("click", () => {
+  void downloadLocalModel();
+});
+
+elements.copyLocalServiceCommand.addEventListener("click", () => {
+  void copyLocalServiceCommand();
+});
+
+elements.retryLocalService.addEventListener("click", () => {
+  setLocalNotice("正在重新检测本地控制服务…");
+  void pollLocal();
+});
+
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.target !== "extension-view") return;
   if (message.state) runtimeState = message.state;
@@ -478,4 +904,12 @@ window.addEventListener("unhandledrejection", (event) => {
   setError(event.reason?.message || String(event.reason));
 });
 
-void refresh().catch((error) => setError(error.message));
+void refresh()
+  .then(() => pollLocal())
+  .catch((error) => setError(error.message));
+localPollTimer = setInterval(() => {
+  void pollLocal();
+}, LOCAL_POLL_MS);
+window.addEventListener("unload", () => {
+  if (localPollTimer) clearInterval(localPollTimer);
+});

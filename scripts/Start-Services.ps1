@@ -7,7 +7,10 @@ param(
     [switch]$TranslateOnComplete,
     [double]$PauseSegmentationSeconds = 1.0,
     [double]$TranslationMaxSegmentSeconds = 2.5,
-    [string]$Glossary = ''
+    [string]$Glossary = '',
+    [string]$TranslationModel = '9b-q4km',
+    [string]$TranslationModelPath = '',
+    [string]$AsrModel = 'large-v3-turbo'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,9 +20,46 @@ $logs = Join-Path $root 'logs'
 $translationScript = Join-Path $research 'start_translation_server.ps1'
 $wlkServer = Join-Path $research 'wlk-venv\Scripts\whisperlivekit-server.exe'
 $wlkWorkdir = Join-Path $research 'WhisperLiveKit'
-$translationAlias = 'Index-Translate-9B'
 
 New-Item -ItemType Directory -Path $logs -Force | Out-Null
+
+# Local translation presets. The popup offers the same ids through the local
+# control service, so keep the mapping here as the single source of truth.
+$translationPresets = @{
+    '9b-q4km' = @{
+        Alias = 'Index-Translate-9B'
+        Path = (Join-Path $research 'models\index-translate-9b\Index-Translate-9B.Q4_K_M.gguf')
+        Label = 'Index-Translate-9B Q4_K_M'
+    }
+    '2b-iq4xs' = @{
+        Alias = 'Index-Translate-2B'
+        Path = (Join-Path $research 'models\index-translate-2b\Index-Translate-2B.IQ4_XS.gguf')
+        Label = 'Index-Translate-2B IQ4_XS'
+    }
+}
+
+$asrModels = @('large-v3-turbo', 'medium', 'small', 'base')
+
+if ($TranslationModelPath) {
+    $translationModelPath = $TranslationModelPath
+    $translationAlias = [IO.Path]::GetFileNameWithoutExtension($translationModelPath)
+    $translationLabel = $translationAlias
+} else {
+    if (-not $translationPresets.ContainsKey($TranslationModel)) {
+        throw "Unknown translation model '$TranslationModel'. Known: $($translationPresets.Keys -join ', ')"
+    }
+    $preset = $translationPresets[$TranslationModel]
+    $translationModelPath = $preset.Path
+    $translationAlias = $preset.Alias
+    $translationLabel = $preset.Label
+}
+$translationModelPath = [IO.Path]::GetFullPath($translationModelPath)
+if (-not $AsrOnly -and -not (Test-Path -LiteralPath $translationModelPath)) {
+    throw "Translation model file not found: $translationModelPath. Download $translationLabel from https://huggingface.co/IndexTeam first."
+}
+if ($asrModels -notcontains $AsrModel) {
+    throw "Unknown ASR model '$AsrModel'. Known: $($asrModels -join ', ')"
+}
 
 function Get-PortListeners([int]$Port) {
     @(
@@ -108,6 +148,7 @@ if ($AsrOnly) {
         $translationStart = & $translationScript `
             -Port $TranslationPort `
             -Alias $translationAlias `
+            -ModelPath $translationModelPath `
             -ContextSize 2048
     } else {
         try {
@@ -151,7 +192,7 @@ if ($wlkListeners.Count -gt 0) {
         '--host', '127.0.0.1',
         '--port', $WlkPort.ToString(),
         '--backend', 'faster-whisper',
-        '--model', 'large-v3-turbo',
+        '--model', $AsrModel,
         '--lan', 'en',
         '--pause-segmentation-seconds', $PauseSegmentationSeconds.ToString(
             [Globalization.CultureInfo]::InvariantCulture
@@ -184,6 +225,10 @@ if ($wlkListeners.Count -gt 0) {
         $wlkArgs += @('--openai-translation-glossary', $Glossary)
     }
 
+    # Whisper model downloads go through huggingface_hub. Its Xet transfer
+    # protocol stalls behind the local proxy on this machine, while the plain
+    # HTTP path completes normally. Set it only when the caller is neutral.
+    if (-not $env:HF_HUB_DISABLE_XET) { $env:HF_HUB_DISABLE_XET = '1' }
     $stdoutLog = Join-Path $logs 'wlk.stdout.log'
     $stderrLog = Join-Path $logs 'wlk.stderr.log'
     $wlk = Start-Process `
@@ -195,7 +240,9 @@ if ($wlkListeners.Count -gt 0) {
         -RedirectStandardError $stderrLog `
         -PassThru
 
-    $wlkHealth = Wait-ForHealth "http://127.0.0.1:$WlkPort/health" 180
+    # A first run with an uncached ASR model has to download ~1.5 GB from
+    # Hugging Face before /health answers, which can exceed three minutes.
+    $wlkHealth = Wait-ForHealth "http://127.0.0.1:$WlkPort/health" 600
     if (-not $wlkHealth) {
         if (Test-Path -LiteralPath $stderrLog) {
             Get-Content -LiteralPath $stderrLog -Encoding utf8 |
@@ -213,7 +260,9 @@ if ($wlkListeners.Count -gt 0) {
     Wlk = $wlkStatus
     WlkPort = $WlkPort
     WlkBackend = 'faster-whisper'
-    WlkModel = 'large-v3-turbo'
+    WlkModel = $AsrModel
+    TranslationLabel = if ($AsrOnly) { 'ASR only' } else { $translationLabel }
+    TranslationModelPath = if ($AsrOnly) { '' } else { $translationModelPath }
     TranslateOnComplete = if ($AsrOnly) { $false } else { [bool]$TranslateOnComplete }
     PauseSegmentationSeconds = $PauseSegmentationSeconds
     TranslationMaxSegmentSeconds = $TranslationMaxSegmentSeconds
