@@ -596,6 +596,46 @@ output {
   overflow-wrap: anywhere;
 }
 
+/* The overlay switch stays on when injection fails, so the failure has to be
+   spelled out here instead of looking like a dead toggle. */
+.overlay-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 4px 0 0;
+  padding: 7px 9px;
+  border-left: 3px solid var(--gold);
+  background: rgba(216, 165, 55, 0.12);
+  color: var(--signal-dark);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.overlay-hint[hidden] {
+  display: none;
+}
+
+.overlay-hint span {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.overlay-hint button {
+  flex: none;
+  padding: 3px 8px;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.overlay-hint button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 .service-results {
   display: grid;
   gap: 5px;

@@ -49,7 +49,35 @@
   const WHEEL_STEP_PX = 48;
   const WHEEL_COOLDOWN_MS = 700;
   const IDLE_FADE_MS = 3500;
-  const HISTORY_API = globalThis.ShengmuOverlayHistory;
+  // overlay-history.js ships in the same injection list and must run first. An
+  // older worker build injects content-overlay.js on its own, and dereferencing
+  // the missing helper used to abort this whole script, so the page overlay
+  // never appeared at all. Fall back to a log-only shim that keeps live
+  // captions working, and delegate history syncing at call time so a later
+  // injection of overlay-history.js restores scrollback without a rebuild.
+  const HISTORY_API = globalThis.ShengmuOverlayHistory || {
+    createHistoryLog(limit) {
+      return {
+        limit: Math.max(1, Number(limit) || 1),
+        entries: [],
+        byId: new Map()
+      };
+    },
+    resetHistoryLog(log) {
+      if (!log) return;
+      log.entries.length = 0;
+      log.byId.clear();
+    },
+    syncHistoryLog(log, lines) {
+      const api = globalThis.ShengmuOverlayHistory;
+      return api ? api.syncHistoryLog(log, lines) : false;
+    }
+  };
+  if (!globalThis.ShengmuOverlayHistory) {
+    console.warn(
+      "声幕浮层：缺少 overlay-history.js，滚动回看已降级（请在 chrome://extensions 重新加载扩展）"
+    );
+  }
   const historyLog = HISTORY_API.createHistoryLog(HISTORY_LIMIT);
   let scrollbackSnapshot = null;
   let scrollBack = 0;

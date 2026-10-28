@@ -23,6 +23,9 @@ const elements = {
   fontSize: document.querySelector("#fontSize"),
   fontSizeValue: document.querySelector("#fontSizeValue"),
   overlayEnabled: document.querySelector("#overlayEnabled"),
+  overlayHint: document.querySelector("#overlayHint"),
+  overlayHintText: document.querySelector("#overlayHintText"),
+  overlayRetry: document.querySelector("#overlayRetry"),
   openPanelOnStart: document.querySelector("#openPanelOnStart"),
   wsUrl: document.querySelector("#wsUrl"),
   probeButton: document.querySelector("#probeButton"),
@@ -172,6 +175,7 @@ function render() {
   elements.fontSize.value = String(settings.fontSize);
   elements.fontSizeValue.value = String(settings.fontSize);
   elements.overlayEnabled.checked = settings.overlayEnabled;
+  renderOverlayHint();
   elements.openPanelOnStart.checked = settings.openPanelOnStart;
   elements.wsUrl.value = settings.wsUrl;
   renderTranslationSettings();
@@ -179,6 +183,19 @@ function render() {
 
 function setFieldValue(element, value) {
   if (document.activeElement !== element) element.value = value;
+}
+
+function renderOverlayHint() {
+  // A stale failure from a finished session must not keep warning the user, so
+  // only an active capture with the overlay switched on shows the hint.
+  const failure =
+    settings.overlayEnabled && runtimeState?.active
+      ? runtimeState?.overlayError || ""
+      : "";
+  elements.overlayHint.hidden = !failure;
+  elements.overlayHintText.textContent = failure
+    ? `页面浮层没有生效：${failure}（若刚更新过扩展，请在 chrome://extensions 重新加载并刷新标签页）`
+    : "";
 }
 
 function renderTranslationSettings() {
@@ -687,6 +704,25 @@ elements.overlayEnabled.addEventListener("change", () => {
   void savePatch({ overlayEnabled: elements.overlayEnabled.checked }).catch(
     (error) => setError(error.message)
   );
+});
+
+elements.overlayRetry.addEventListener("click", async () => {
+  elements.overlayRetry.disabled = true;
+  setError();
+  try {
+    const response = await chrome.runtime.sendMessage({
+      target: "background",
+      type: "refresh-overlay"
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error || "重新注入失败，请查看扩展 Service Worker 的控制台");
+    }
+  } catch (error) {
+    setError(error?.message || String(error));
+  } finally {
+    elements.overlayRetry.disabled = false;
+    await refresh();
+  }
 });
 
 elements.openPanelOnStart.addEventListener("change", () => {

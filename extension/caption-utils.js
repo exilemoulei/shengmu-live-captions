@@ -46,6 +46,9 @@ export const EMPTY_RUNTIME_STATE = Object.freeze({
   updatedAt: null,
   wsConnected: false,
   lineCount: 0,
+  // Empty when the page overlay is healthy; otherwise the injection error, so
+  // the popup can explain why the switch produces nothing.
+  overlayError: "",
   audio: null,
   translation: null,
   current: {
@@ -56,6 +59,27 @@ export const EMPTY_RUNTIME_STATE = Object.freeze({
     epochId: null
   }
 });
+
+// Detail line shown while the page overlay is broken; cleared again once an
+// injection succeeds so the status label goes back to its normal wording.
+export const OVERLAY_UNAVAILABLE_DETAIL =
+  "页面浮层不可用，可在字幕窗口中继续观看";
+
+// Idempotent transition for the page-overlay health flag. Mutates the state in
+// place and reports whether anything changed, so callers can skip a broadcast.
+export function applyOverlayFailure(state, error) {
+  if (!state) return false;
+  const message = error ? String(error?.message || error) : "";
+  if ((state.overlayError || "") === message) return false;
+  state.overlayError = message;
+  if (message) {
+    state.detail = OVERLAY_UNAVAILABLE_DETAIL;
+  } else if (state.detail === OVERLAY_UNAVAILABLE_DETAIL) {
+    // The normal status label falls back to the status wording when empty.
+    state.detail = "";
+  }
+  return true;
+}
 
 // "dual" keeps the previous translated line above the current one, so a
 // sentence cut in two by the ASR segmenter still reads continuously.

@@ -4,6 +4,7 @@ import {
   HISTORY_CHANGED_KEY,
   RUNTIME_STATE_KEY,
   SETTINGS_KEY,
+  applyOverlayFailure,
   getTranslationText,
   lineChanged,
   lineNeedsTranslation,
@@ -316,6 +317,7 @@ async function broadcastCaptionState() {
       lineCount: runtimeState.lineCount,
       wsConnected: runtimeState.wsConnected,
       updatedAt: runtimeState.updatedAt,
+      overlayError: runtimeState.overlayError || "",
       current: safeClone(runtimeState.current)
     },
     settings: settingsForBroadcast(settingsCache)
@@ -361,19 +363,40 @@ async function injectOverlay(tabId = runtimeState.tabId) {
     });
   } catch (error) {
     console.warn("声幕页面浮层注入失败", error);
+    await reportOverlayFailure(error);
     return false;
   }
   try {
-    await chrome.tabs.sendMessage(tabId, {
+    // A content script that threw during startup has no listener yet; the
+    // sendMessage rejection is the only signal the worker ever gets, so treat
+    // it as an injection failure instead of swallowing it.
+    const response = await chrome.tabs.sendMessage(tabId, {
       target: "content",
       type: "init",
       settings: settingsForBroadcast(settingsCache),
       state: compactRuntimeState()
     });
-  } catch {
-    // The injected script can request the latest state after initialization.
+    if (response && response.ok === false) {
+      throw new Error(response.error || "浮层初始化被拒绝");
+    }
+  } catch (error) {
+    console.warn("声幕页面浮层没有响应", error);
+    await reportOverlayFailure(error);
+    return false;
   }
+  if (runtimeState.overlayError) await reportOverlayFailure(null);
   return true;
+}
+
+// Surfaced in the popup so a broken overlay never fails silently: the switch
+// stays on while nothing appears, which reads as "the toggle does nothing".
+async function reportOverlayFailure(error) {
+  if (!applyOverlayFailure(runtimeState, error)) return;
+  await persistRuntimeState(true);
+  // Both audiences matter: the content script needs the caption state, and the
+  // extension views need the new overlayError to show or clear the hint.
+  await broadcastToExtension({ type: "status" });
+  await broadcastCaptionState();
 }
 
 async function hideOverlay() {
@@ -383,12 +406,10 @@ async function hideOverlay() {
 async function applyOverlaySetting() {
   if (!runtimeState.tabId) return;
   if (settingsCache.overlayEnabled) {
+    // injectOverlay() records overlayError (and broadcasts) on its own, so a
+    // failure must not trigger a second, identical broadcast here.
     const injected = await injectOverlay(runtimeState.tabId);
-    if (!injected && runtimeState.active) {
-      runtimeState.detail = "页面浮层不可用，可在字幕窗口中继续观看";
-      await broadcastToExtension({ type: "session-state" });
-    }
-    await broadcastCaptionState();
+    if (injected) await broadcastCaptionState();
   } else {
     await hideOverlay();
   }
@@ -1238,6 +1259,9 @@ async function finalizeSession(status, detail, options = {}) {
       runtimeState.active = false;
       runtimeState.status = finalStatus;
       runtimeState.detail = finalDetail || runtimeState.detail;
+      // The overlay failure belongs to the session that just ended; keeping it
+      // would leave a stale warning in the popup and a tabId to re-inject into.
+      runtimeState.overlayError = "";
       runtimeState.wsConnected = false;
       runtimeState.lineCount = lineCount;
       runtimeState.translationMissing = translationMissing;
@@ -1648,9 +1672,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const saved = await saveSettings({ overlayEnabled: false });
         sendResponse({ ok: true, settings: saved });
       } else if (message.type === "refresh-overlay") {
+        if (!isExtensionPageSender(sender)) {
+          rejectNonExtensionSender(sendResponse);
+          return;
+        }
+        if (!runtimeState.active || !runtimeState.tabId) {
+          sendResponse({ ok: false, error: "当前没有正在采集的标签页" });
+          return;
+        }
         const injected = await injectOverlay();
-        sendResponse({ ok: injected });
+        sendResponse({
+          ok: injected,
+          error: injected
+            ? ""
+            : runtimeState.overlayError || "页面浮层没有响应"
+        });
       } else if (message.type === "content-ready") {
+        // The content script finished initializing on its own: whatever init
+        // handshake failed earlier is stale now.
+        if (
+          runtimeState.overlayError &&
+          sender?.tab?.id &&
+          sender.tab.id === runtimeState.tabId
+        ) {
+          await reportOverlayFailure(null);
+        }
         sendResponse({
           ok: true,
           state: compactRuntimeState(),

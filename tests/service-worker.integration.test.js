@@ -282,3 +282,21 @@ test("extension UI can test the configured translation API", async () => {
     await api.close();
   }
 });
+
+test("refresh-overlay refuses to inject without an active capture", async () => {
+  const response = await sendToBackground({
+    target: "background",
+    type: "refresh-overlay"
+  });
+  assert.equal(response.ok, false);
+  assert.match(response.error, /没有正在采集的标签页/);
+});
+
+test("content scripts cannot force overlay re-injection", async () => {
+  const response = await sendToBackground(
+    { target: "background", type: "refresh-overlay" },
+    { url: "https://example.com/live" }
+  );
+  assert.equal(response.ok, false);
+  assert.match(response.error, /扩展界面|拒绝/);
+});

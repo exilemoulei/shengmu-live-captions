@@ -4,7 +4,7 @@
 
 声幕 (Shengmu) 是一个 Chrome MV3 扩展，捕获当前标签页的英文音频，通过本地 WhisperLiveKit 实时识别，再由 DeepSeek API 或本地 Index-Translate-9B 翻译成中文，以浮层字幕和历史记录窗口的形式呈现。所有处理在本机完成。
 
-- **当前版本**：0.5.0（`package.json` 与 `extension/manifest.json` 同步维护）
+- **当前版本**：0.5.1（`package.json` 与 `extension/manifest.json` 同步维护）
 - **运行环境**：Windows 11，PowerShell 7，Chrome，NVIDIA GPU
 - **服务端口**：WhisperLiveKit `8010`、翻译服务 `8013`、本地控制服务 `8014`、Chrome DevTools `9223`
 
@@ -29,13 +29,13 @@ Chrome tabCapture
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `service-worker.js` | 1704 | 扩展后台核心：tabCapture 生命周期管理、WebSocket 与 ASR 通信、字幕合并与广播、设置存储、跨 epoch 时间码累加、标签页关闭收尾 |
-| `content-overlay.js` | 1217 | 页面浮层 UI：拖动、字号调整、滚轮回看历史（条目快照 + 冻结行）、暂停保留、重新注入防重复 |
+| `service-worker.js` | 1750 | 扩展后台核心：tabCapture 生命周期管理、WebSocket 与 ASR 通信、字幕合并与广播、设置存储、跨 epoch 时间码累加、标签页关闭收尾、浮层注入失败上报 |
+| `content-overlay.js` | 1245 | 页面浮层 UI：拖动、字号调整、滚轮回看历史（条目快照 + 冻结行）、暂停保留、重新注入防重复、缺 overlay-history.js 时降级 |
 | `subtitle.js` | 1020 | 字幕与历史窗口：场次列表、搜索、续看、SRT 导出、增量渲染（追加/滑动/重建） |
+| `popup.js` | 951 | 扩展弹出面板：启动/停止、翻译引擎配置、API Key 管理、本地模型状态与一键启动、浮层失败提示 |
 | `translation-api.js` | 670 | 翻译 API 客户端：DeepSeek/OpenAI/本地服务端三种 provider、鉴权错误处理、400 重试、用量统计 |
 | `offscreen.js` | 592 | offscreen document：维持 WebSocket 长连接（service worker 休眠时不断线） |
-| `caption-utils.js` | 482 | 纯函数工具：字幕合并、显示模式选择、设置归一化与迁移、静音碎片行过滤 |
-| `popup.js` | 902 | 扩展弹出面板：启动/停止、翻译引擎配置、API Key 管理、本地模型状态与一键启动 |
+| `caption-utils.js` | 521 | 纯函数工具：字幕合并、显示模式选择、设置归一化与迁移、静音碎片行过滤、浮层失败状态转换 |
 | `history-db.js` | 181 | IndexedDB 封装：字幕与场次的读写 |
 | `history-write-queue.js` | 113 | 历史写入串行化：失败批次保留并自动重试，防止旧写入覆盖新译文 |
 | `overlay-history.js` | 94 | 浮层历史回看：增量合并、晚到译文原地刷新、上限裁剪 |
@@ -45,7 +45,7 @@ Chrome tabCapture
 
 | 目录 | 说明 |
 |------|------|
-| `tests/` | 6 个 Node.js 内置 test runner 测试文件（54 项），覆盖纯函数、队列、渲染、翻译 API、本地模型设置 |
+| `tests/` | 6 个 Node.js 内置 test runner 测试文件（57 项），覆盖纯函数、队列、渲染、翻译 API、本地模型设置、浮层失败状态转换与重新注入前置校验 |
 | `scripts/` | PowerShell 脚本：启动/停止服务、启动/停止本地控制服务、启动开发浏览器、加载扩展 |
 | `scripts/local-service/` | 本地控制服务（`server.mjs`，Node 原生 http，`127.0.0.1:8014`）：给控制面板提供状态查询、一键启动/停止、模型列表与下载 |
 | `paseo/` | Paseo 代理会话记录与评审证据 |
@@ -196,6 +196,7 @@ Get-ChildItem -LiteralPath .\extension -Filter *.js |
 - **标签页跳转**：跳转后继续采集并同步标题、URL，但需要确认 tabCapture 是否成功迁移。
 - **标签页关闭**：只执行一次收尾，保留结束原因并保存最终字幕。
 - **页面刷新**：自动重新注入浮层。
+- **旧 service worker + 新内容脚本会崩掉浮层**：改过 `extension/` 后如果只在 `chrome://extensions` 重新加载页面、没有重新加载扩展，service worker 仍是旧代码，注入的文件列表可能与磁盘上的内容脚本不匹配（0.4.1 的 worker 只注入 `content-overlay.js`，而 0.4.2+ 的脚本依赖先执行的 `overlay-history.js`）。此时浮层抛 `Cannot read properties of undefined (reading 'createHistoryLog')`，整个脚本中断，表现为「后台在跑、记录有、浮层始终不出现、开关像失灵」。0.5.1 起 `content-overlay.js` 在缺少 `ShengmuOverlayHistory` 时降级（失去滚轮回看但浮层照常显示），worker 也会把注入失败写进 `runtimeState.overlayError` 并在 popup 的浮层开关下显示提示和「重新注入」按钮，不再静默失败。遇到这类现象先确认扩展整体 reload 过。
 
 ### 关键文件位置
 

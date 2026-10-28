@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  EMPTY_RUNTIME_STATE,
+  OVERLAY_UNAVAILABLE_DETAIL,
+  applyOverlayFailure,
   buildSrt,
   isNoiseTranscript,
   lineNeedsTranslation,
@@ -387,4 +390,33 @@ test("buildSrt uses continuous timestamps after reconnect", () => {
     buildSrt(lines),
     /00:02:01,000 --> 00:02:03,000/
   );
+});
+
+test("applyOverlayFailure records and clears the overlay error idempotently", () => {
+  const state = structuredClone(EMPTY_RUNTIME_STATE);
+  assert.equal(state.overlayError, "");
+
+  assert.equal(
+    applyOverlayFailure(state, new Error("Cannot inject")),
+    true
+  );
+  assert.equal(state.overlayError, "Cannot inject");
+  assert.equal(state.detail, OVERLAY_UNAVAILABLE_DETAIL);
+
+  // Repeating the same failure must not schedule another broadcast.
+  assert.equal(applyOverlayFailure(state, "Cannot inject"), false);
+  assert.equal(state.detail, OVERLAY_UNAVAILABLE_DETAIL);
+
+  assert.equal(applyOverlayFailure(state, null), true);
+  assert.equal(state.overlayError, "");
+  assert.equal(state.detail, "");
+  assert.equal(applyOverlayFailure(state, null), false);
+
+  // A later failure must not clobber an unrelated detail line on success.
+  state.detail = "实时";
+  assert.equal(applyOverlayFailure(state, "boom"), true);
+  assert.equal(state.detail, OVERLAY_UNAVAILABLE_DETAIL);
+  assert.equal(applyOverlayFailure(state, null), true);
+  assert.equal(state.detail, "");
+  assert.equal(applyOverlayFailure(null, "boom"), false);
 });

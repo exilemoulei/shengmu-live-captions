@@ -135,3 +135,4 @@ v0.5.0 增加本地模型一键启动：控制面板新增“本地模型”区�
 v0.4.2 的评审问题修复用无服务的 CDP 冒烟脚本验证（专用 Chrome 9223 + 未打包扩展，向内容脚本注入伪造 `caption-state`）：12 项全部通过——历史面板 12 条、晚到译文原地刷新、新行不顶动阅读位置、滚回实时不带动网页、关闭后滚轮恢复滚动网页、重新注入后仍只有一个浮层且一格滚轮只走一行、拖拽（含面板打开时）与窗口缩放后命中区域跟随、历史日志封顶 60 条、回看期间新增 40 行后冻结行不消失。截图见 `paseo/evidence/v042-overlay-history-open.png` 与 `v042-overlay-history-closed.png`；细节见 `paseo/06-review-fixes-0.4.2.md`。真实 ASR/翻译链路的 240 秒采集回归本轮未重跑。
 
 服务日志写入 `logs`，Chrome 专用配置写入 `chrome-profile`，研究脚本和测试产物写入 `.research`，均不纳入版本控制。
+v0.5.1 修掉“后台在跑但页面浮层完全不出现、开关像失灵”的问题。根因是扩展没有整体 reload：旧 service worker 只注入 `content-overlay.js`，而新版脚本依赖先执行的 `overlay-history.js` 提供的 `ShengmuOverlayHistory`，取不到时整段脚本抛错退出，浮层从未创建。现在 `content-overlay.js` 在缺少该依赖时降级运行（只失去滚轮回看，双行上一句随后恢复），service worker 把注入/`init` 失败写进 `runtimeState.overlayError` 并广播，控制面板在浮层开关下显示失败原因和“重新注入”按钮，不再静默失败。验证：`npm test` 57 项全过；CDP 实测只注入单文件时浮层正常显示、补充注入后双行上一句恢复、`overlayError` 提示在注入成功后消失且非采集状态不显示。遇到同类现象先确认扩展整体 reload 过并刷新页面。
