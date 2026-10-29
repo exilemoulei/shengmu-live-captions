@@ -1,0 +1,9 @@
+{
+  "dormantAfterDays": 90,
+  "dormantAfterDaysUnverified": 30,
+  "maxResults": 3,
+  "maxBodyLines": 40,
+  "probeShell": "auto",
+  "probeDefaultTimeoutSec": 20,
+  "autoCommit": true
+}
