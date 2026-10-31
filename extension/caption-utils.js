@@ -4,6 +4,10 @@ import {
   DEFAULT_TRANSLATION_TIMEOUT_MS,
   normalizeTranslationSettings
 } from "./translation-api.js";
+import {
+  GLOSSARY_PRESET_IDS,
+  MAX_CUSTOM_GLOSSARY_CHARS
+} from "./glossary.js";
 
 export const SETTINGS_KEY = "settings";
 export const RUNTIME_STATE_KEY = "runtimeState";
@@ -13,6 +17,10 @@ export const HISTORY_CHANGED_KEY = "historyRevision";
 // presets in scripts/Start-Services.ps1.
 export const LOCAL_TRANSLATION_MODELS = Object.freeze(["9b-q4km", "2b-iq4xs"]);
 export const LOCAL_ASR_MODELS = Object.freeze(["large-v3-turbo", "medium"]);
+
+// A domain hint is a single short sentence handed to the model; anything longer
+// is prompt pollution, so the stored value is clipped.
+export const MAX_GLOSSARY_DOMAIN_HINT_CHARS = 120;
 
 export const DEFAULT_SETTINGS = Object.freeze({
   wsUrl: "ws://127.0.0.1:8010/asr?target_language=zh",
@@ -30,7 +38,14 @@ export const DEFAULT_SETTINGS = Object.freeze({
   translationModel: "deepseek-chat",
   translationApiKeys: Object.freeze({}),
   translationTranslatePartial: true,
-  translationTimeoutMs: DEFAULT_TRANSLATION_TIMEOUT_MS
+  translationTimeoutMs: DEFAULT_TRANSLATION_TIMEOUT_MS,
+  // Glossary settings live inside `settings`: the chrome.storage.local top
+  // level keys are frozen, and content scripts never receive these fields
+  // through sanitizeSettingsPatch.
+  glossaryEnabled: true,
+  glossaryPresetIds: Object.freeze([]),
+  glossaryDomainHint: "",
+  customGlossary: ""
 });
 
 export const EMPTY_RUNTIME_STATE = Object.freeze({
@@ -152,8 +167,35 @@ export function normalizeSettings(value = {}) {
     translationModel: translation.model,
     translationApiKeys: translation.apiKeys,
     translationTranslatePartial: translation.translatePartial,
-    translationTimeoutMs: translation.timeoutMs
+    translationTimeoutMs: translation.timeoutMs,
+    glossaryEnabled: value.glossaryEnabled !== false,
+    glossaryPresetIds: normalizeGlossaryPresetIds(value.glossaryPresetIds),
+    glossaryDomainHint: normalizeGlossaryDomainHint(value.glossaryDomainHint),
+    customGlossary: normalizeCustomGlossary(value.customGlossary)
   };
+}
+
+/** Unknown or duplicated preset ids are dropped, so a stale storage value (a
+ * preset that no longer ships) cannot enable anything. */
+function normalizeGlossaryPresetIds(value) {
+  const ids = [];
+  for (const item of Array.isArray(value) ? value : []) {
+    const id = String(item || "").trim();
+    if (!GLOSSARY_PRESET_IDS.includes(id) || ids.includes(id)) continue;
+    ids.push(id);
+  }
+  return ids;
+}
+
+function normalizeGlossaryDomainHint(value) {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_GLOSSARY_DOMAIN_HINT_CHARS);
+}
+
+function normalizeCustomGlossary(value) {
+  return String(value ?? "").slice(0, MAX_CUSTOM_GLOSSARY_CHARS);
 }
 
 /**
@@ -186,6 +228,17 @@ export function settingsForBroadcast(value = {}) {
       ])
     )
   };
+}
+
+/**
+ * Settings a page-side content script may see. The caption overlay never reads
+ * the glossary text, and a 32 KB custom dictionary would otherwise ride along
+ * on every caption-state broadcast, so it is dropped here while extension
+ * pages keep using settingsForBroadcast.
+ */
+export function settingsForCaptions(value = {}) {
+  const { customGlossary, ...safe } = settingsForBroadcast(value);
+  return safe;
 }
 
 export function normalizeWsUrl(value) {

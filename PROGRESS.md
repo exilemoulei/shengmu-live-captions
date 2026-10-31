@@ -1,5 +1,32 @@
 # 项目进度记录 (PROGRESS.md)
 
+## 2026-10-31 · 0.5.3：术语库基建（解析/匹配/序列化 + 设置字段，不含术语表内容）
+
+设计/验收记录：`paseo/11-glossary-0.5.3.md`。范围由用户拍板：只做基建层，内置 PoE 预设留空壳，popup 面板 / 翻译注入 / ASR context / `-Glossary` 打通留到下一步。
+
+### 已修改文件
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\extension\glossary.js`（新增，443 行）：零 `chrome.*`/DOM 纯函数。`GLOSSARY_PRESETS`（`poe` 空壳 + `domainHint`）、`parseGlossaryText`（`->`/`=>`/`=`/`,`/制表符分隔、`|` 别名、`#`/`//` 注释、引号遮罩（引号内逗号/竖线不切分）、CSV 表头跳过与引号还原、同主拼写后写覆盖）、`collectGlossaryEntries`（预设 + 自定义合并，自定义优先）、`matchGlossaryTerms`（词边界、英文复数/所有格折叠、长词优先 + 字符区间遮挡、每批 ≤24 条、正则缓存）、`buildGlossaryMap`、`buildGlossaryTermPattern`、`buildAsrContextPrompt`（仅 ASCII 英文源词，≤360 字符）、`serializeWlkGlossary`（别名展开成独立 `source -> target`，洗 `;；`，≤4000 字符）、`exportGlossaryText`（text/csv 双格式，均能原样读回）。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\extension\caption-utils.js`：`DEFAULT_SETTINGS` 增 `glossaryEnabled`/`glossaryPresetIds`/`glossaryDomainHint`/`customGlossary`；`normalizeSettings` 增三条归一（未知/重复预设 id 丢弃、领域提示压空白截 120、自定义词条截 32 KB）；新增 `MAX_GLOSSARY_DOMAIN_HINT_CHARS`。术语字段不进 `TAB_ALLOWED_SETTING_KEYS`。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\tests\glossary.test.js`（新增）：21 例，覆盖解析各格式、CSV 表头与引号、覆盖优先级、复数/所有格/`ies`、短词边界（`ES` 不碰 `best`/`test`）、长词遮挡（`Orb of Augmentation` 压 `Orb`）、`maxMatches`、空输入、`poe-041` 真实误听句（`Path of Excel`/`Isamite`/`dominating blow`）、ASR 提示词预算、WLK 序列化清洗与不可表达源词跳过、字面竖线、emoji 与弯引号、text/csv 往返。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\tests\caption-utils.test.js`：+5 例（术语设置默认与非法预设 id、预算截断、`sanitizeSettingsPatch` 拦截术语字段、`settingsForBroadcast` 保留术语字段、`settingsForCaptions` 剥离 `customGlossary`）。
+- `extension/service-worker.js`：`broadcastCaptionState` 与 `injectOverlay` 的 init 改用 `settingsForCaptions`，发往标签页的对象不再携带 32 KB 自定义词条（审阅 P2）。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\package.json` `extension/manifest.json`：版本 0.5.2 → 0.5.3。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\AGENTS.md`：首段版本与文档锚点、`npm test` 数量 57→80、分层表加 `glossary.js`、§4 增两条术语库红线。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\paseo\11-glossary-0.5.3.md`（新增）：数据模型、解析/匹配规则、三个序列化器、空壳预设约定、真实语料验证、下一步。
+
+### 已执行验证
+- `npm test`：87 项全通过（本次 +26：`tests/glossary.test.js` 21 例 + `tests/caption-utils.test.js` 5 例）。
+- `node --check`：`extension/glossary.js`、`extension/caption-utils.js`、`tests/glossary.test.js` 通过。
+- 真实语料冒烟（`.research/poe-041/transcripts.md` 66 条英文行 + 对话里列出的 12 条 PoE 词条作 fixture）：10 行命中、11 次命中，含 `Path of Exile`×3 / `Path of Excel`×1 / `runesmithing`×3 / `Isamite`×2 等；1000+ 字符超长行命中 6 条不卡；`buildAsrContextPrompt` 196 字符、`serializeWlkGlossary` 316 字符，均未触顶。
+- 已知不命中（设计内）：`sectors are thematically perfect`（实为 `scepters`）不靠别名纠错——`sector` 是真实英文常用词，登记别名会在其他语境误伤，留待「领域提示 + 模型纠偏」。
+
+### 未执行 / 待后续决定
+- 术语库下一步 4 项均未做（见 `paseo/11-glossary-0.5.3.md` §8）：`translation-api.js` 注入、`service-worker.js` 传词条与 WS `?context=`、`server.mjs` + `Start-Services.ps1` 的 `-Glossary` 打通与 `-Restart` 判定、popup 术语库面板。
+- 预设词库内容（60~100 条）未写；360 字符 ASR 预算装不下全部专名时，需要一个「核心专名优先」的分级字段，待词条内容定稿后再选型（词条级 `core` 标记 vs 预设包级 `asrTerms[]` 短名单）。
+- 跨模型审阅（GPT-6 Luna，`review=code review`）两轮完成：首轮无 P0、P1 两条 + P2 三条，全部已修；复审确认可提交，又指出两个引号遮罩边界 P2（emoji 代理对错位、弯引号误当字段引号），一并修掉并补往返用例。审阅第三条 P1（新增测试被 `.gitignore` 忽略、不会随仓库交付）成立，已把 `/tests/` 移出 `.gitignore`，测试随后续提交入库。详见 `paseo/11-glossary-0.5.3.md` §9。
+- `.gitignore` 移除 `/tests/`：`tests/` 全部 7 个文件随之入库（此前自 0.4.x 起被忽略）；`paseo/`、`AGENTS.md`、`.research/`、`test-assets/` 仍为本地。
+- 未做浏览器实测：本次不含 UI 与运行时链路。`extension/glossary.js` 目前只被 `caption-utils.js` 引入两个常量（预设 id 列表、自定义词条长度上限），匹配与序列化函数尚无运行时调用者，扩展实际行为与 0.5.2 一致。
+
 ## 2026-10-31 · 0.5.2：ASR 参数、显示锁、浮层宽度、透明度滑块（Helium 实测）
 
 设计/验收记录：`paseo/10-asr-width-opacity-0.5.2.md`。

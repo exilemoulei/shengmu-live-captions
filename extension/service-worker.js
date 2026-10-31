@@ -15,7 +15,8 @@ import {
   normalizeWsUrl,
   sanitizeSettingsPatch,
   selectDisplayCaption,
-  settingsForBroadcast
+  settingsForBroadcast,
+  settingsForCaptions
 } from "./caption-utils.js";
 import {
   TRANSLATION_PROVIDERS,
@@ -320,7 +321,7 @@ async function broadcastCaptionState() {
       overlayError: runtimeState.overlayError || "",
       current: safeClone(runtimeState.current)
     },
-    settings: settingsForBroadcast(settingsCache)
+    settings: settingsForCaptions(settingsCache)
   });
 }
 
@@ -373,7 +374,7 @@ async function injectOverlay(tabId = runtimeState.tabId) {
     const response = await chrome.tabs.sendMessage(tabId, {
       target: "content",
       type: "init",
-      settings: settingsForBroadcast(settingsCache),
+      settings: settingsForCaptions(settingsCache),
       state: compactRuntimeState()
     });
     if (response && response.ok === false) {
