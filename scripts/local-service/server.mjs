@@ -94,6 +94,9 @@ let job = {
   exitCode: null
 };
 let jobChild = null;
+// WhisperLiveKit has no endpoint that reports whether it translates, so the
+// mode we last started it with is the only reliable hint. null means unknown.
+let startedWlkMode = null;
 let download = null;
 let downloadChild = null;
 
@@ -334,50 +337,114 @@ async function handleStart(payload) {
   if (job.state === "starting" || job.state === "stopping") {
     return { status: 409, body: { ok: false, error: `已有任务在进行：${job.state}` } };
   }
-  const translationModel = resolveTranslationModel(payload.translationModel);
-  if (!translationModel) {
-    return { status: 400, body: { ok: false, error: "未知的本地翻译模型" } };
-  }
   const asrModel = resolveAsrModel(payload.asrModel);
   if (!asrModel) {
     return { status: 400, body: { ok: false, error: "未知的 ASR 模型" } };
   }
-  const modelPath = path.join(translationModel.dir, translationModel.file);
-  if (!fileExists(modelPath)) {
-    return {
-      status: 409,
-      body: {
-        ok: false,
-        error: `本地翻译模型尚未下载：${translationModel.file}`,
-        needsDownload: translationModel.id,
-        downloadUrl: translationModel.downloadUrl
-      }
-    };
+  // In "api" mode with a working key the extension translates with its own
+  // provider, so the local llama.cpp server would only burn the VRAM the ASR
+  // needs and hand WhisperLiveKit a translation the extension discards. Start
+  // ASR only. Without an explicit `true` (old popup, no key, `server` mode) the
+  // local model is still the one producing Chinese, so it starts as usual.
+  const asrOnly =
+    payload.translationMode === "api" && payload.apiTranslationConfigured === true;
+  const translationModel = resolveTranslationModel(payload.translationModel);
+  if (!asrOnly) {
+    if (!translationModel) {
+      return { status: 400, body: { ok: false, error: "未知的本地翻译模型" } };
+    }
+    const modelPath = path.join(translationModel.dir, translationModel.file);
+    if (!fileExists(modelPath)) {
+      return {
+        status: 409,
+        body: {
+          ok: false,
+          error: `本地翻译模型尚未下载：${translationModel.file}`,
+          needsDownload: translationModel.id,
+          downloadUrl: translationModel.downloadUrl
+        }
+      };
+    }
   }
 
   const status = await probeServiceState();
-  const modelMismatch =
-    status.translation.online && status.translation.model !== translationModel.alias;
-  if (modelMismatch || (!status.translation.online && (await hasPortListener(TRANSLATION_PORT)))) {
-    pushLog(`停止旧翻译服务（当前 ${status.translation.model || "未知"}）`);
-    await runStopServices();
+  let wlkOnline = await hasPortListener(ASR_PORT);
+  const translationOnline = await hasPortListener(TRANSLATION_PORT);
+  const desiredWlkMode = asrOnly ? "asr-only" : "translation";
+
+  async function stopServicesOrFail(reason) {
+    pushLog(reason);
+    const stopped = await runStopServices();
+    if (!stopped.ok) {
+      return stopped.error || `退出码 ${stopped.code}`;
+    }
+    wlkOnline = false;
+    startedWlkMode = null;
+    return "";
+  }
+
+  if (asrOnly) {
+    if (translationOnline) {
+      const failure = await stopServicesOrFail(
+        "API 翻译模式：停止本地翻译服务，把显存让给 ASR"
+      );
+      if (failure) {
+        return {
+          status: 500,
+          body: { ok: false, error: `停止旧服务失败：${failure}` }
+        };
+      }
+    }
+  } else {
+    const modelMismatch =
+      status.translation.online && status.translation.model !== translationModel.alias;
+    if (modelMismatch || (!status.translation.online && translationOnline)) {
+      const failure = await stopServicesOrFail(
+        `停止旧翻译服务（当前 ${status.translation.model || "未知"}）`
+      );
+      if (failure) {
+        return {
+          status: 500,
+          body: { ok: false, error: `停止旧服务失败：${failure}` }
+        };
+      }
+    }
+  }
+
+  const startArgs = ["-AsrModel", asrModel.id];
+  if (asrOnly) startArgs.push("-AsrOnly");
+  else startArgs.push("-TranslationModel", translationModel.id);
+
+  // WhisperLiveKit does not expose its translation mode, so a leftover process
+  // is judged from what we started, plus what the ports show. Switching modes
+  // has to restart it: otherwise ASR-only keeps ignoring a freshly started
+  // llama.cpp, and translation mode keeps calling a server we just stopped.
+  if (wlkOnline && startedWlkMode !== desiredWlkMode) {
+    const modeSwitch =
+      desiredWlkMode === "asr-only" || !status.translation.online;
+    if (modeSwitch) {
+      pushLog(
+        desiredWlkMode === "asr-only"
+          ? "WhisperLiveKit 仍在翻译模式，重启为 ASR-only"
+          : "WhisperLiveKit 可能仍运行在 ASR-only，重启以恢复翻译"
+      );
+      startArgs.push("-Restart");
+    }
   }
 
   job = {
     state: "starting",
     action: "start",
-    message: `正在启动 ${translationModel.label} + ${asrModel.label}`,
+    translationMode: asrOnly ? "asr-only" : "translation",
+    message: asrOnly
+      ? `正在启动 ASR ${asrModel.label}（API 翻译，不启动本地翻译模型）`
+      : `正在启动 ${translationModel.label} + ${asrModel.label}`,
     startedAt: Date.now(),
     finishedAt: null,
     exitCode: null
   };
 
-  const child = spawnPowerShell(START_SCRIPT, [
-    "-TranslationModel",
-    translationModel.id,
-    "-AsrModel",
-    asrModel.id
-  ]);
+  const child = spawnPowerShell(START_SCRIPT, startArgs);
   jobChild = child;
   child.on("error", (error) => {
     jobChild = null;
@@ -395,6 +462,7 @@ async function handleStart(payload) {
     if (job.state === "stopping") return;
     const finishedAt = Date.now();
     if (code === 0) {
+      startedWlkMode = job.translationMode || null;
       job = { ...job, state: "finished", message: "本地服务已就绪", finishedAt, exitCode: code };
     } else {
       const tail = logTail.slice(-4).join(" | ");
@@ -434,6 +502,8 @@ async function handleStop() {
     exitCode: null
   };
   const result = await runStopServices();
+  // Nothing is running any more, so the recorded WhisperLiveKit mode is void.
+  if (result.ok) startedWlkMode = null;
   job = {
     ...job,
     state: result.ok ? "idle" : "error",

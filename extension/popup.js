@@ -22,6 +22,8 @@ const elements = {
   displayMode: document.querySelector("#displayMode"),
   fontSize: document.querySelector("#fontSize"),
   fontSizeValue: document.querySelector("#fontSizeValue"),
+  opacity: document.querySelector("#opacity"),
+  opacityValue: document.querySelector("#opacityValue"),
   overlayEnabled: document.querySelector("#overlayEnabled"),
   overlayHint: document.querySelector("#overlayHint"),
   overlayHintText: document.querySelector("#overlayHintText"),
@@ -77,7 +79,6 @@ let activeTab = null;
 let runtimeState = null;
 let settings = normalizeSettings(DEFAULT_SETTINGS);
 let busy = false;
-let fontSaveTimer = null;
 let localPollTimer = null;
 
 // Local model control plane. Mirrors what `.research/local-service/server.mjs`
@@ -92,6 +93,30 @@ const local = {
 };
 
 const LOCAL_NOTICE_TTL_MS = 15000;
+
+// Slider values must survive the runtime-state broadcasts that arrive while the
+// user is still dragging or while the debounced save is in flight; otherwise the
+// thumb snaps back to the stored value mid-drag.
+function createSliderSaver(delayMs, save) {
+  const state = { timer: null, token: 0 };
+  state.push = (value) => {
+    clearTimeout(state.timer);
+    const token = ++state.token;
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      save(value)
+        .catch((error) => setError(error.message))
+        .finally(() => {
+          if (token === state.token) state.token = 0;
+        });
+    }, delayMs);
+  };
+  state.busy = () => Boolean(state.timer) || state.token > 0;
+  return state;
+}
+
+const fontSlider = createSliderSaver(180, (value) => savePatch({ fontSize: value }));
+const opacitySlider = createSliderSaver(180, (value) => savePatch({ opacity: value }));
 
 function setLocalNotice(text) {
   local.notice = text || "";
@@ -172,8 +197,17 @@ function render() {
   elements.primaryButton.disabled = busy;
 
   elements.displayMode.value = settings.displayMode;
-  elements.fontSize.value = String(settings.fontSize);
-  elements.fontSizeValue.value = String(settings.fontSize);
+  // A slider being dragged, or one whose save is still debounced, must not be
+  // yanked back to the stored value by a background state broadcast.
+  if (!fontSlider.busy()) {
+    elements.fontSize.value = String(settings.fontSize);
+    elements.fontSizeValue.value = String(settings.fontSize);
+  }
+  if (!opacitySlider.busy()) {
+    const opacityPercent = Math.round(settings.opacity * 100);
+    elements.opacity.value = String(opacityPercent);
+    elements.opacityValue.value = `${opacityPercent}%`;
+  }
   elements.overlayEnabled.checked = settings.overlayEnabled;
   renderOverlayHint();
   elements.openPanelOnStart.checked = settings.openPanelOnStart;
@@ -348,6 +382,14 @@ function renderLocal() {
       ? download
       : null;
   const jobRunning = job?.state === "starting" || job?.state === "stopping";
+  // The local llama.cpp server is only unnecessary when the extension really
+  // translates with its own provider. Without an API key the local model is the
+  // fallback that still produces Chinese, so it stays part of the start.
+  const apiKeyConfigured = Boolean(
+    settings.translationApiKeyConfigured?.[settings.translationProvider]
+  );
+  const usesApiTranslation =
+    settings.translationMode === "api" && apiKeyConfigured;
 
   let badgeLabel = "控制服务未连接";
   let badgeClass = "warning";
@@ -358,8 +400,11 @@ function renderLocal() {
     } else if (job?.state === "error") {
       badgeLabel = "启动失败";
       badgeClass = "warning";
-    } else if (services?.translation?.online && services?.asr?.online) {
-      badgeLabel = "全部在线";
+    } else if (
+      services?.asr?.online &&
+      (usesApiTranslation || services?.translation?.online)
+    ) {
+      badgeLabel = usesApiTranslation ? "ASR 在线" : "全部在线";
       badgeClass = "online";
     } else {
       badgeLabel = "控制服务已连接";
@@ -380,20 +425,32 @@ function renderLocal() {
   }`.trim();
 
   const translationOnline = Boolean(services?.translation?.online);
-  elements.localTranslationState.textContent = translationOnline
-    ? `在线 · ${services.translation.model || "已就绪"}`
-    : jobRunning
-      ? "启动中…"
-      : "未连接";
-  elements.localTranslationState.className = `local-state ${
-    translationOnline ? "online" : jobRunning ? "" : "warning"
-  }`.trim();
+  if (usesApiTranslation) {
+    elements.localTranslationState.textContent = "由 API 翻译，不启动本地模型";
+    elements.localTranslationState.className = "local-state";
+  } else {
+    elements.localTranslationState.textContent = translationOnline
+      ? `在线 · ${services.translation.model || "已就绪"}`
+      : jobRunning
+        ? "启动中…"
+        : "未连接";
+    elements.localTranslationState.className = `local-state ${
+      translationOnline ? "online" : jobRunning ? "" : "warning"
+    }`.trim();
+  }
 
   syncModelSelects();
 
   let hint = "";
   if (!local.serviceOnline) {
     hint = "启动本地控制服务后，可以在这里一键拉起 ASR 与本地翻译模型。";
+  } else if (usesApiTranslation) {
+    hint = "API 翻译模式只需本地 ASR：启动后不占用显存跑翻译模型，显存与算力全部留给识别。";
+    if (asrModel) {
+      hint += asrModel.cached
+        ? `；ASR ${asrModel.label} 已缓存`
+        : `；ASR ${asrModel.label} 首次启动会自动下载（${asrModel.sizeLabel}）`;
+    }
   } else if (translationModel) {
     hint = translationModel.exists
       ? `翻译模型已就绪：${formatBytes(translationModel.bytes)}`
@@ -409,11 +466,17 @@ function renderLocal() {
     if (runningModel && runningModel !== translationModel.alias) {
       hint += `；当前运行 ${runningModel}，点“一键启动”会切换到所选模型`;
     }
+    if (settings.translationMode === "api") {
+      hint += "；API Key 未配置，本地模型将作为惠底翻译";
+    }
   }
   elements.localModelHint.textContent = hint;
 
   const needsDownload = Boolean(
-    local.serviceOnline && translationModel && !translationModel.exists
+    local.serviceOnline &&
+      !usesApiTranslation &&
+      translationModel &&
+      !translationModel.exists
   );
   elements.localMissingBox.hidden = !needsDownload;
   if (needsDownload) {
@@ -477,7 +540,7 @@ function renderLocal() {
     local.busy ||
     jobRunning ||
     downloading ||
-    !translationModel?.exists ||
+    (!usesApiTranslation && !translationModel?.exists) ||
     !asrModel;
   const anyServiceOnline = Boolean(
     services?.asr?.online || services?.translation?.online
@@ -519,12 +582,17 @@ async function startLocalServices() {
   setLocalNotice("");
   renderLocal();
   try {
+    const apiKeyConfigured = Boolean(
+      settings.translationApiKeyConfigured?.[settings.translationProvider]
+    );
     const payload = await localRequest("/start", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         translationModel: settings.localTranslationModel,
-        asrModel: settings.localAsrModel
+        asrModel: settings.localAsrModel,
+        translationMode: settings.translationMode,
+        apiTranslationConfigured: apiKeyConfigured
       }),
       timeoutMs: 15000
     });
@@ -692,12 +760,13 @@ elements.displayMode.addEventListener("change", () => {
 elements.fontSize.addEventListener("input", () => {
   const value = Number(elements.fontSize.value);
   elements.fontSizeValue.value = String(value);
-  clearTimeout(fontSaveTimer);
-  fontSaveTimer = setTimeout(() => {
-    void savePatch({ fontSize: value }).catch((error) =>
-      setError(error.message)
-    );
-  }, 180);
+  fontSlider.push(value);
+});
+
+elements.opacity.addEventListener("input", () => {
+  const percent = Number(elements.opacity.value);
+  elements.opacityValue.value = `${percent}%`;
+  opacitySlider.push(percent / 100);
 });
 
 elements.overlayEnabled.addEventListener("change", () => {
@@ -743,9 +812,20 @@ elements.wsUrl.addEventListener("change", () => {
 });
 
 elements.translationMode.addEventListener("change", () => {
-  void savePatch({ translationMode: elements.translationMode.value }).catch(
-    (error) => setError(error.message)
-  );
+  const next = elements.translationMode.value;
+  void savePatch({ translationMode: next })
+    .then(() => {
+      // WhisperLiveKit only reads its translation arguments at startup, so a
+      // running session keeps the old engine until the capture restarts.
+      if (runtimeState?.active) {
+        setError(
+          next === "api"
+            ? "已切到 API 翻译：请停止并重新开始字幕，ASR 才会按新模式（不加载本地翻译模型）运行"
+            : "已切到本地服务端翻译：请停止并重新开始字幕，ASR 才会恢复本地翻译"
+        );
+      }
+    })
+    .catch((error) => setError(error.message));
 });
 
 elements.translationProvider.addEventListener("change", () => {

@@ -199,11 +199,21 @@ if ($wlkListeners.Count -gt 0) {
         ),
         '--pcm-input',
         '--backend-policy', 'localagreement',
+        # Kept at 0.5 s on purpose: dropping it to 0.3 produced a decode pass
+        # twice as often, which turned 54% of the lines into fragments such as
+        # "The." / "现在。" on the 120 s quality sample.
         '--asr-coalesce-min-s', '0.5',
-        '--localagreement-beam-size', '1',
+        # Beam 3 instead of greedy: fast speech needs the second opinion, and
+        # two decodes that never agree are what force a buffer reset.
+        '--localagreement-beam-size', '3',
         '--retention-seconds', '300',
+        # 10 s (upstream default 15) instead of 4: a sentence that fails to
+        # commit is trimmed instead of being thrown away wholesale.
         '--buffer_trimming', 'segment',
-        '--buffer_trimming_sec', '4',
+        '--buffer_trimming_sec', '10',
+        # Commit words with probability > 0.95 without waiting for a second
+        # agreeing pass: CJK subtitles land ~0.5 s earlier per line.
+        '--confidence-validation',
         '--log-level', 'INFO'
     )
     if (-not $AsrOnly) {

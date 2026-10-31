@@ -1,5 +1,7 @@
 (() => {
-  const OVERLAY_VERSION = 4;
+  // Bumped with the 0.5.2 restructure (caption-stack + width sync + stale slot):
+  // an overlay left behind by the previous injection must be rebuilt, not reused.
+  const OVERLAY_VERSION = 5;
   const existing = globalThis.__shengmuCaptionOverlay;
   if (existing?.version === OVERLAY_VERSION && existing.refresh) {
     existing.refresh();
@@ -23,6 +25,8 @@
   let host = null;
   let shadow = null;
   let stage = null;
+  let stack = null;
+  let shell = null;
   let sourceElement = null;
   let translationElement = null;
   let previousElement = null;
@@ -36,6 +40,9 @@
   let positionPending = false;
   let dragState = null;
   let sizeObserver = null;
+  let shellWidthPx = 0;
+  let shellShrinkTimer = 0;
+  let measureContext = null;
   let stageRectCache = null;
   let historyRectCache = null;
   let lastPanelRect = null;
@@ -49,6 +56,13 @@
   const WHEEL_STEP_PX = 48;
   const WHEEL_COOLDOWN_MS = 700;
   const IDLE_FADE_MS = 3500;
+  // Width policy for the caption box: hugging text is the point, but a frame
+  // that resizes on every streamed token is worse than a wide one. Growth is
+  // immediate, shrinking waits for the text to settle.
+  const SHELL_WIDTH_MIN_PX = 240;
+  const SHELL_WIDTH_MAX_PX = 860;
+  const SHELL_WIDTH_VIEWPORT_RATIO = 0.68;
+  const SHELL_SHRINK_DELAY_MS = 420;
   // overlay-history.js ships in the same injection list and must run first. An
   // older worker build injects content-overlay.js on its own, and dereferencing
   // the missing helper used to abort this whole script, so the page overlay
@@ -138,10 +152,12 @@
           bottom: 8vh;
           display: flex;
           flex-direction: column;
-          align-items: stretch;
+          align-items: center;
           gap: 8px;
-          width: min(82vw, 1180px);
-          min-width: 320px;
+          /* Upper bound only. The box that is actually drawn is .caption-shell,
+             which hugs its text inside this anchoring stage. */
+          width: min(68vw, 860px);
+          min-width: 260px;
           transform: translateX(-50%);
           color: #fffdf4;
           font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
@@ -152,6 +168,13 @@
           transform: none;
         }
         .stage[hidden] { display: none; }
+        .caption-stack {
+          position: relative;
+          align-self: center;
+          width: fit-content;
+          max-width: 100%;
+          transition: width 170ms ease-out;
+        }
         .history {
           position: absolute;
           left: 0;
@@ -163,13 +186,15 @@
           max-height: 40vh;
           padding: 12px 20px 10px;
           overflow: hidden;
-          border: 1px solid rgba(255, 249, 225, 0.13);
-          border-left: 3px solid rgba(232, 184, 75, 0.5);
+          border: 1px solid rgb(255 249 225 / calc(0.13 * var(--overlay-opacity)));
+          border-left: 3px solid rgb(232 184 75 / calc(0.5 + var(--overlay-opacity) * 0.5));
           border-radius: 3px 13px 13px 3px;
+          /* The history panel is read, not watched, so it keeps a readable floor
+             even when the user pulls the background almost fully transparent. */
           background:
-            linear-gradient(105deg, rgba(20, 28, 24, 0.9), rgba(12, 17, 15, 0.84));
-          box-shadow: 0 16px 40px rgba(0, 0, 0, 0.36);
-          backdrop-filter: blur(11px) saturate(0.8);
+            linear-gradient(105deg, rgb(20 28 24 / max(0.62, var(--overlay-opacity))), rgb(12 17 15 / max(0.58, var(--overlay-opacity))));
+          box-shadow: 0 16px 40px rgb(0 0 0 / calc(0.36 * var(--overlay-opacity)));
+          backdrop-filter: blur(calc(11px * max(0.4, var(--overlay-opacity)))) saturate(0.8);
         }
         .history[hidden] { display: none; }
         .history-list {
@@ -233,21 +258,24 @@
           display: flex;
           flex-direction: column;
           justify-content: flex-end;
+          width: 100%;
           /* With a large font on a short window the slots could still add up to
              more than the viewport. Cap the shell and let the older slots
              shrink first, so the current translation always stays readable. */
           max-height: min(70vh, 680px);
           padding: 18px 22px 16px;
           overflow: hidden;
-          border: 1px solid rgba(255, 249, 225, 0.16);
-          border-left: 3px solid #e8b84b;
+          /* Every chrome layer fades with the same opacity variable, so pulling
+             the slider down reaches "text only" instead of a glass slab. */
+          border: 1px solid rgb(255 249 225 / calc(0.16 * var(--overlay-opacity)));
+          border-left: 3px solid rgb(232 184 75 / var(--overlay-opacity));
           border-radius: 3px 13px 13px 3px;
           background:
-            linear-gradient(105deg, rgba(20, 28, 24, calc(var(--overlay-opacity) + 0.04)), rgba(12, 17, 15, var(--overlay-opacity)));
+            linear-gradient(105deg, rgb(20 28 24 / min(1, calc(var(--overlay-opacity) + 0.04))), rgb(12 17 15 / var(--overlay-opacity)));
           box-shadow:
-            0 20px 54px rgba(0, 0, 0, 0.42),
-            inset 0 1px rgba(255, 255, 255, 0.06);
-          backdrop-filter: blur(11px) saturate(0.8);
+            0 20px 54px rgb(0 0 0 / calc(0.42 * var(--overlay-opacity))),
+            inset 0 1px rgb(255 255 255 / calc(0.06 * var(--overlay-opacity)));
+          backdrop-filter: blur(calc(11px * var(--overlay-opacity))) saturate(0.8);
         }
         .caption-shell::after {
           position: absolute;
@@ -255,7 +283,7 @@
           right: 0;
           width: 38%;
           height: 1px;
-          background: linear-gradient(90deg, transparent, rgba(232, 184, 75, 0.65));
+          background: linear-gradient(90deg, transparent, rgb(232 184 75 / calc(0.65 * var(--overlay-opacity))));
           content: "";
         }
         /* One ASR segment can cover minutes of speech. Every caption slot is
@@ -339,6 +367,12 @@
         }
         .translation.failed {
           color: rgba(255, 186, 162, 0.9);
+        }
+        /* A sentence whose translation has not arrived yet keeps the previous
+           translation on screen. It stays at full size (a smaller font there
+           would make the box jump on every sentence) and is only dimmed. */
+        .translation.stale {
+          color: rgba(255, 253, 244, 0.58);
         }
         .drag-handle {
           position: absolute;
@@ -447,7 +481,7 @@
         }
         .translation-error.visible { display: block; }
         @media (max-width: 720px) {
-          .stage { width: 92vw; bottom: 5vh; }
+          .stage { width: 92vw; min-width: 0; bottom: 5vh; }
           .caption-shell { padding: 13px 15px 12px; }
           .toolbar { right: 50%; transform: translate(50%, 4px); }
           .stage:hover .toolbar,
@@ -459,29 +493,33 @@
       </style>
       <section class="stage" aria-live="polite" hidden>
         <button class="drag-handle" type="button" aria-label="拖动字幕位置"></button>
-        <div class="toolbar" role="toolbar" aria-label="字幕控制">
-          <span class="live-chip">声幕</span>
-          <span class="status-text"></span>
-          <span class="divider"></span>
-          <button type="button" data-action="mode" title="切换字幕显示模式">双语</button>
-          <button type="button" data-action="smaller" title="缩小字幕">A−</button>
-          <button type="button" data-action="larger" title="放大字幕">A＋</button>
-          <button type="button" data-action="monitor" title="打开字幕与历史窗口">记录</button>
-          <button type="button" data-action="close" title="隐藏页面浮层">×</button>
-        </div>
         <div class="history" hidden>
           <div class="history-list"></div>
           <div class="history-meta"></div>
         </div>
-        <div class="caption-shell">
-          <div class="prev-translation"><span class="caption-text"></span></div>
-          <div class="source"><span class="caption-text"></span></div>
-          <div class="translation" role="status"><span class="caption-text"></span></div>
-          <div class="translation-error"></div>
+        <div class="caption-stack">
+          <div class="toolbar" role="toolbar" aria-label="字幕控制">
+            <span class="live-chip">声幕</span>
+            <span class="status-text"></span>
+            <span class="divider"></span>
+            <button type="button" data-action="mode" title="切换字幕显示模式">双语</button>
+            <button type="button" data-action="smaller" title="缩小字幕">A−</button>
+            <button type="button" data-action="larger" title="放大字幕">A＋</button>
+            <button type="button" data-action="monitor" title="打开字幕与历史窗口">记录</button>
+            <button type="button" data-action="close" title="隐藏页面浮层">×</button>
+          </div>
+          <div class="caption-shell">
+            <div class="prev-translation"><span class="caption-text"></span></div>
+            <div class="source"><span class="caption-text"></span></div>
+            <div class="translation" role="status"><span class="caption-text"></span></div>
+            <div class="translation-error"></div>
+          </div>
         </div>
       </section>
     `;
     stage = shadow.querySelector(".stage");
+    stack = shadow.querySelector(".caption-stack");
+    shell = shadow.querySelector(".caption-shell");
     sourceElement = shadow.querySelector(".source");
     translationElement = shadow.querySelector(".translation");
     previousElement = shadow.querySelector(".prev-translation");
@@ -696,6 +734,88 @@
     modeButton.textContent = currentModeLabel();
   }
 
+  // Caption text is laid out by the browser, so the target width is measured on
+  // a detached canvas instead: the widest visible slot decides how wide the box
+  // wants to be. Measuring the DOM would feed the current width back into the
+  // next measurement and oscillate under `text-wrap: balance`.
+  function measureSlotWidth(slot) {
+    const textNode = slot?.firstElementChild;
+    const text = textNode?.textContent || "";
+    if (!text) return 0;
+    const style = getComputedStyle(textNode);
+    measureContext ||= document.createElement("canvas").getContext("2d");
+    if (!measureContext) return 0;
+    measureContext.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+    const spacing = parseFloat(style.letterSpacing) || 0;
+    let widest = 0;
+    for (const line of text.split("\n")) {
+      widest = Math.max(
+        widest,
+        measureContext.measureText(line).width + spacing * line.length
+      );
+    }
+    return widest;
+  }
+
+  function applyShellWidth(width) {
+    shellWidthPx = width;
+    if (stack) stack.style.width = `${width}px`;
+  }
+
+  // Target width for the current text, or 0 when there is nothing to measure.
+  function measureShellWidth() {
+    if (!stack || !shell || !stage || stage.hidden) return 0;
+    const style = getComputedStyle(shell);
+    const chromeWidth =
+      (parseFloat(style.paddingLeft) || 0) +
+      (parseFloat(style.paddingRight) || 0) +
+      (parseFloat(style.borderLeftWidth) || 0) +
+      (parseFloat(style.borderRightWidth) || 0);
+    let contentWidth = 0;
+    for (const slot of [previousElement, sourceElement, translationElement]) {
+      if (!slot || !slot.classList.contains("visible")) continue;
+      contentWidth = Math.max(contentWidth, measureSlotWidth(slot));
+    }
+    const limit = Math.min(
+      Math.round(window.innerWidth * SHELL_WIDTH_VIEWPORT_RATIO),
+      SHELL_WIDTH_MAX_PX
+    );
+    return Math.min(
+      limit,
+      Math.max(SHELL_WIDTH_MIN_PX, Math.ceil(contentWidth + chromeWidth))
+    );
+  }
+
+  // A pending shrink must re-measure before it applies: the text may have grown
+  // back in the meantime, and applying the old, narrower target would wrap a
+  // sentence that already fits.
+  function scheduleShellShrink() {
+    if (shellShrinkTimer) return;
+    shellShrinkTimer = setTimeout(() => {
+      shellShrinkTimer = 0;
+      const target = measureShellWidth();
+      if (target && target < shellWidthPx - 1) applyShellWidth(target);
+    }, SHELL_SHRINK_DELAY_MS);
+  }
+
+  // Grow immediately (the CSS transition smooths it), shrink only after the
+  // text has stopped changing: a streamed sentence grows every few hundred ms
+  // and would otherwise make the frame twitch on every token.
+  function syncShellWidth() {
+    const wanted = measureShellWidth();
+    if (!wanted) return;
+    if (wanted > shellWidthPx + 1) {
+      clearTimeout(shellShrinkTimer);
+      shellShrinkTimer = 0;
+      applyShellWidth(wanted);
+    } else if (wanted < shellWidthPx - 1) {
+      scheduleShellShrink();
+    } else {
+      clearTimeout(shellShrinkTimer);
+      shellShrinkTimer = 0;
+    }
+  }
+
   // Overlay caption slots wrap their text in a span so the slot itself can be a
   // fixed-height, bottom-aligned window: the span keeps its natural height and
   // its top is clipped once the text runs past the cap.
@@ -756,6 +876,7 @@
 
   function handleWindowResize() {
     applyStoredPosition();
+    syncShellWidth();
     refreshCaptionOverflow();
   }
 
@@ -1020,23 +1141,23 @@
         failed: Boolean(displayCaption.failed)
       };
     }
+    // Fallback for a worker that predates displayCaption: same rule, newest
+    // source first and the last known translation held as pending.
     const lines = Array.isArray(current.lines) ? current.lines : [];
-    const line = [...lines].reverse().find((item) => item?.source || item?.translation);
+    const reversed = [...lines].reverse();
+    const line = reversed.find((item) => item?.source || item?.translation);
+    const translated = reversed.find((item) => lineTranslation(item));
     const bufferSource = clean(current.bufferSource);
     const bufferTranslation = clean(current.bufferTranslation);
+    const own = bufferSource ? bufferTranslation : lineTranslation(line);
     const source = bufferSource || clean(line?.source);
-    const translation = bufferSource
-      ? bufferTranslation
-      : clean(line?.translation);
-    const failed = Boolean(
-      line?.translationFailed && !bufferSource && !translation
-    );
+    const failed = Boolean(!bufferSource && line?.translationFailed && !own);
     return {
-      lineId: line?.id || null,
+      lineId: bufferSource ? null : line?.id || null,
       source,
-      translation,
+      translation: own || (failed ? "" : lineTranslation(translated)),
       error: clean(current.translationError),
-      pending: Boolean(source && !translation && !failed),
+      pending: Boolean(source && !own && !failed),
       failed
     };
   }
@@ -1073,12 +1194,18 @@
     if (settings.displayMode === "english") {
       setCaptionText(sourceElement, "");
       setCaptionText(translationElement, caption.source);
-      translationElement.classList.remove("pending", "failed");
+      translationElement.classList.remove("pending", "stale", "failed");
     } else {
       setCaptionText(translationElement, caption.translation);
+      // `pending` is the empty placeholder, `stale` the previous sentence held
+      // on screen until its successor is translated.
       translationElement.classList.toggle(
         "pending",
-        !caption.translation && !caption.failed
+        Boolean(caption.pending && !caption.translation)
+      );
+      translationElement.classList.toggle(
+        "stale",
+        Boolean(caption.pending && caption.translation)
       );
       translationElement.classList.toggle("failed", Boolean(caption.failed));
       setCaptionText(
@@ -1093,6 +1220,7 @@
 
     // reveal first, then resolve a position that was requested while hidden
     if (positionPending) applyStoredPosition();
+    syncShellWidth();
     refreshCaptionOverflow();
     keepStageInViewport();
     renderScrollback();

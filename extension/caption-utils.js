@@ -111,6 +111,18 @@ export function clamp(value, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
+// Opacity 0 is a real user choice (text only), so it must not fall back to the
+// default the way a plain `Number(value) || default` would.
+function normalizeOpacity(value) {
+  if (value === undefined || value === null || value === "") {
+    return DEFAULT_SETTINGS.opacity;
+  }
+  const numeric = Number(value);
+  return Number.isFinite(numeric)
+    ? clamp(numeric, 0.05, 1)
+    : DEFAULT_SETTINGS.opacity;
+}
+
 export function normalizeSettings(value = {}) {
   const displayMode = DISPLAY_MODES.has(value.displayMode)
     ? value.displayMode
@@ -122,7 +134,7 @@ export function normalizeSettings(value = {}) {
     wsUrl: normalizeWsUrl(value.wsUrl || DEFAULT_SETTINGS.wsUrl),
     displayMode,
     fontSize: Math.round(clamp(Number(value.fontSize) || DEFAULT_SETTINGS.fontSize, 20, 64)),
-    opacity: clamp(Number(value.opacity) || DEFAULT_SETTINGS.opacity, 0.25, 1),
+    opacity: normalizeOpacity(value.opacity),
     overlayEnabled: value.overlayEnabled !== false,
     openPanelOnStart: value.openPanelOnStart !== false,
     autoScroll: value.autoScroll !== false,
@@ -266,36 +278,30 @@ export function selectDisplayCaption(current = {}) {
   const translatedLine = reversedLines.find((line) => getTranslationText(line));
   const bufferSource = cleanText(current.bufferSource);
   const bufferTranslation = cleanText(current.bufferTranslation);
-  const bufferIsComplete = Boolean(bufferSource && bufferTranslation);
 
-  let source = "";
-  let translation = "";
-  let lineId = null;
-  let failed = false;
-  if (bufferIsComplete) {
-    source = bufferSource;
-    translation = bufferTranslation;
-  } else if (translatedLine) {
-    lineId = translatedLine.id || null;
-    source = cleanText(translatedLine.source) || getTranslationText(translatedLine);
-    translation = getTranslationText(translatedLine);
-  } else {
-    lineId = latestLine?.id || null;
-    source = bufferSource || cleanText(latestLine?.source);
-    translation = bufferSource
-      ? bufferTranslation
-      : getTranslationText(latestLine);
-    failed = Boolean(
-      !bufferSource && latestLine?.translationFailed && !translation
-    );
-  }
+  // The source slot never waits for a translation: the newest English (the
+  // uncommitted buffer while it is still growing, otherwise the newest
+  // committed line) goes on screen as soon as the ASR produces it. The
+  // translation slot keeps the previous sentence, flagged `pending`, until the
+  // matching translation lands.
+  const latestSource = bufferSource || cleanText(latestLine?.source);
+  const latestTranslation = bufferSource
+    ? bufferTranslation
+    : getTranslationText(latestLine);
+  const lineId = bufferSource ? null : latestLine?.id || null;
+  const failed = Boolean(
+    !bufferSource && latestLine?.translationFailed && !latestTranslation
+  );
 
   return {
     lineId,
-    source,
-    translation,
+    // Never copy a translation into the source slot: a translation-only line
+    // would otherwise print Chinese in the English row of bilingual mode.
+    source: latestSource,
+    translation:
+      latestTranslation || (failed ? "" : getTranslationText(translatedLine)),
     error: cleanText(current.translationError),
-    pending: Boolean(source && !translation && !failed),
+    pending: Boolean(latestSource && !latestTranslation && !failed),
     failed
   };
 }
