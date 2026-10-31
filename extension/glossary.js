@@ -4,17 +4,15 @@
  * This module deliberately has no Chrome extension or DOM imports so it can be
  * unit-tested with Node's built-in test runner and reused by the service
  * worker, the popup, and the local control service alike.
- *
- * The bundled preset dictionaries are intentionally empty: this file only ships
- * the infrastructure (one preset slot per domain) so a later change can fill
- * `entries` without touching parsing, matching, or settings code.
  */
+
+import { POE_PRESET_ENTRIES } from "./glossary-poe.js";
 
 // Custom entries are parsed on every translation batch, so the stored text is
 // capped to keep chrome.storage.local small and prompt building predictable.
 export const MAX_CUSTOM_GLOSSARY_CHARS = 32 * 1024;
 // WhisperLiveKit accepts up to 1000 characters of per-session context; the
-// remainder is left for a domain hint and for safer URL encoding.
+// remainder is left for safer URL encoding and rolling ASR history.
 export const MAX_ASR_CONTEXT_CHARS = 360;
 export const MAX_GLOSSARY_MATCHES = 24;
 // Windows caps a command line near 32k characters; the WLK glossary travels as
@@ -26,15 +24,11 @@ export const GLOSSARY_PRESETS = Object.freeze({
     id: "poe",
     label: "流放之路 (Path of Exile 1/2)",
     domainHint: "Path of Exile (流放之路) 游戏直播",
-    // Filled by the glossary-content task; the infrastructure works with an
-    // empty array, and an empty preset contributes no matches.
-    entries: Object.freeze([])
+    entries: POE_PRESET_ENTRIES
   })
 });
 
-export const GLOSSARY_PRESET_IDS = Object.freeze(
-  Object.keys(GLOSSARY_PRESETS)
-);
+export const GLOSSARY_PRESET_IDS = Object.freeze(Object.keys(GLOSSARY_PRESETS));
 
 // Recognised separators between the source side and the target side. `=>` and
 // `->` come before `=` so the first index found is the longest separator.
@@ -48,13 +42,7 @@ const LINE_UNSAFE = /[|｜,，	"“”=]|->|^#|^\/\//;
 // expressed at all; it is skipped instead of being silently rewritten.
 const WLK_UNSAFE_SOURCE = /[;\uFF1B:\r\n]|=|->/;
 const CSV_HEADER_SOURCES = new Set(["source", "src", "原文"]);
-const CSV_HEADER_TARGETS = new Set([
-  "target",
-  "tgt",
-  "target_lang",
-  "tgt_lng",
-  "译文"
-]);
+const CSV_HEADER_TARGETS = new Set(["target", "tgt", "target_lang", "tgt_lng", "译文"]);
 
 // Matching runs over every enabled entry for every batch, so compiled regular
 // expressions are cached. The cap keeps a pathological import from growing the
@@ -137,6 +125,19 @@ function maskQuotedSpans(line) {
   return masked;
 }
 
+const CSV_LANG_TAG = /^(?:auto|tgt_lng|target_lang|[a-z]{2,3}(?:[-_][a-z0-9]{2,8})?)$/i;
+
+function stripCsvLanguageColumn(targetPart) {
+  const masked = maskQuotedSpans(targetPart);
+  const commaIndex = masked.indexOf(",");
+  if (commaIndex < 0) return targetPart;
+  const thirdColumn = cleanText(unquote(targetPart.slice(commaIndex + 1)));
+  if (!thirdColumn || CSV_LANG_TAG.test(thirdColumn)) {
+    return targetPart.slice(0, commaIndex);
+  }
+  return targetPart;
+}
+
 /**
  * Splits one glossary line into its source side and target side. Returns null
  * for a line that carries no separator or has an empty side, so malformed input
@@ -152,7 +153,9 @@ function splitEntryLine(line) {
   }
   if (!chosen) return null;
   const sourcePart = line.slice(0, chosen.index);
-  const targetPart = line.slice(chosen.index + chosen.delimiter.length);
+  const rawTargetPart = line.slice(chosen.index + chosen.delimiter.length);
+  const targetPart =
+    chosen.delimiter === "," ? stripCsvLanguageColumn(rawTargetPart) : rawTargetPart;
   const target = cleanText(unquote(targetPart));
   const sources = splitAliases(sourcePart);
   if (!target || sources.length === 0) return null;
@@ -220,10 +223,7 @@ function normalizeEntries(entries) {
  * the same primary source replaces the preset one, which is how a user fixes a
  * disputed translation without editing the bundled dictionary.
  */
-export function collectGlossaryEntries({
-  presetIds = [],
-  customText = ""
-} = {}) {
+export function collectGlossaryEntries({ presetIds = [], customText = "" } = {}) {
   const merged = new Map();
   for (const id of Array.isArray(presetIds) ? presetIds : []) {
     const preset = GLOSSARY_PRESETS[String(id || "").trim()];
@@ -293,14 +293,8 @@ function overlaps(spans, start, end) {
  * primary spelling and `matched` is the text as it appeared in the caption (an
  * ASR alias such as "Path of Excel" keeps its own spelling).
  */
-export function matchGlossaryTerms(
-  texts,
-  entries,
-  maxMatches = MAX_GLOSSARY_MATCHES
-) {
-  const prepared = (Array.isArray(texts) ? texts : [])
-    .map((text) => cleanText(text))
-    .filter(Boolean);
+export function matchGlossaryTerms(texts, entries, maxMatches = MAX_GLOSSARY_MATCHES) {
+  const prepared = (Array.isArray(texts) ? texts : []).map((text) => cleanText(text)).filter(Boolean);
   if (prepared.length === 0) return [];
   const limit = Math.max(0, Number(maxMatches) || 0);
   if (limit === 0) return [];
@@ -308,9 +302,7 @@ export function matchGlossaryTerms(
   if (candidates.length === 0) return [];
 
   // Flatten to (entry, spelling) pairs sorted by the spelling that will be
-  // matched. Sorting entries by their primary source is not enough: a short
-  // alias of a long entry (`PoE` inside `Path of Exile expansion`) would still
-  // claim the span that the longer entry `PoE trading` needs.
+  // matched so a short alias of a long entry cannot steal a longer phrase span.
   const pairs = [];
   for (const entry of candidates) {
     for (const source of entry.sources) pairs.push({ entry, source });
@@ -340,8 +332,6 @@ export function matchGlossaryTerms(
           spans.set(index, used);
           break;
         }
-        // An empty or rejected match must still advance, otherwise the loop
-        // spins forever on a zero-width pattern.
         regex.lastIndex = Math.max(regex.lastIndex, start + 1);
         match = regex.exec(text);
       }
@@ -349,11 +339,7 @@ export function matchGlossaryTerms(
     }
     if (!matched) continue;
     recorded.add(entry);
-    results.push({
-      source: entry.sources[0],
-      target: entry.target,
-      matched
-    });
+    results.push({ source: entry.sources[0], target: entry.target, matched });
   }
   return results;
 }
@@ -372,10 +358,44 @@ export function buildGlossaryMap(matches) {
 }
 
 /**
+ * Resolves the active glossary state from stored extension settings. Custom
+ * entries are placed ahead of preset entries for ASR context priority while
+ * still overriding matching preset keys for translation.
+ */
+export function resolveEffectiveGlossary(settings = {}) {
+  const enabled = settings?.glossaryEnabled !== false;
+  const presetIds = [];
+  for (const rawId of Array.isArray(settings?.glossaryPresetIds) ? settings.glossaryPresetIds : []) {
+    const id = String(rawId || "").trim();
+    if (GLOSSARY_PRESET_IDS.includes(id) && !presetIds.includes(id)) presetIds.push(id);
+  }
+  const customText = String(settings?.customGlossary ?? "");
+  const customEntries = parseGlossaryText(customText);
+  const presetEntries = collectGlossaryEntries({ presetIds, customText: "" });
+  const entries = enabled ? collectGlossaryEntries({ presetIds, customText }) : [];
+  // Put custom entries first in the ASR prompt candidate list so user-typed
+  // proper nouns never get crowded out by a large preset dictionary.
+  const asrEntries = enabled ? [...customEntries, ...entries] : [];
+  const explicitHint = cleanText(settings?.glossaryDomainHint);
+  const presetHint = presetIds.map((id) => cleanText(GLOSSARY_PRESETS[id]?.domainHint)).find(Boolean) || "";
+  const domainHint = enabled ? explicitHint || presetHint : "";
+  return {
+    enabled,
+    presetIds,
+    presetCount: presetEntries.length,
+    customCount: customEntries.length,
+    entries,
+    asrEntries,
+    domainHint
+  };
+}
+
+/**
  * English-only term list for the faster-whisper `initial_prompt` (passed to
- * WhisperLiveKit as the WebSocket `context` query parameter). Chinese targets
- * would only waste the character budget: the prompt biases English decoding.
- * The domain hint is deliberately excluded for the same reason.
+ * WhisperLiveKit as the WebSocket `context` query parameter). Only each entry's
+ * canonical spelling (`sources[0]`) is included: feeding homophone error
+ * aliases (such as "Path of Excel" or "Isamite") to the ASR decoder would bias
+ * Whisper toward the wrong spelling.
  */
 export function buildAsrContextPrompt(entries, options = {}) {
   const maxChars = Number(options.maxChars) > 0
@@ -385,17 +405,18 @@ export function buildAsrContextPrompt(entries, options = {}) {
   const seen = new Set();
   let length = 0;
   for (const entry of normalizeEntries(entries)) {
-    for (const source of entry.sources) {
-      if (!/[A-Za-z]/.test(source) || /[^\x20-\x7E]/.test(source)) continue;
-      const key = source.toLowerCase();
-      if (seen.has(key)) continue;
-      // `+ 2` for the ", " join so the result never exceeds maxChars.
-      const addition = (picked.length > 0 ? 2 : 0) + source.length;
-      if (length + addition > maxChars) continue;
-      seen.add(key);
-      picked.push(source);
-      length += addition;
+    const source = entry.sources[0];
+    if (!source || !/[A-Za-z]/.test(source) || /[^\x20-\x7E]/.test(source)) {
+      continue;
     }
+    const key = source.toLowerCase();
+    if (seen.has(key)) continue;
+    // `+ 2` for the ", " join so the result never exceeds maxChars.
+    const addition = (picked.length > 0 ? 2 : 0) + source.length;
+    if (length + addition > maxChars) continue;
+    seen.add(key);
+    picked.push(source);
+    length += addition;
   }
   return picked.join(", ");
 }

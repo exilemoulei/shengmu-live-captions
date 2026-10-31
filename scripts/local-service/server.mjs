@@ -84,6 +84,7 @@ const ASR_MODELS = [
 ];
 
 const DOWNLOAD_POLL_MS = 700;
+const MAX_WLK_GLOSSARY_CHARS = 4000;
 const logTail = [];
 let job = {
   state: "idle",
@@ -94,11 +95,21 @@ let job = {
   exitCode: null
 };
 let jobChild = null;
-// WhisperLiveKit has no endpoint that reports whether it translates, so the
-// mode we last started it with is the only reliable hint. null means unknown.
+// WhisperLiveKit has no endpoint that reports whether it translates or which
+// glossary it was started with, so what we last started it with is the only
+// reliable hint. null means unknown.
 let startedWlkMode = null;
+let startedGlossarySignature = null;
 let download = null;
 let downloadChild = null;
+
+function sanitizeWlkGlossary(value) {
+  return String(value ?? "")
+    .replace(/[\0-\x1F\x7F]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_WLK_GLOSSARY_CHARS);
+}
 
 function pushLog(line) {
   const text = String(line).trimEnd();
@@ -380,6 +391,7 @@ async function handleStart(payload) {
     }
     wlkOnline = false;
     startedWlkMode = null;
+    startedGlossarySignature = null;
     return "";
   }
 
@@ -411,31 +423,45 @@ async function handleStart(payload) {
     }
   }
 
+  const desiredGlossary = asrOnly ? "" : sanitizeWlkGlossary(payload.glossary);
   const startArgs = ["-AsrModel", asrModel.id];
-  if (asrOnly) startArgs.push("-AsrOnly");
-  else startArgs.push("-TranslationModel", translationModel.id);
+  if (asrOnly) {
+    startArgs.push("-AsrOnly");
+  } else {
+    startArgs.push("-TranslationModel", translationModel.id);
+    if (desiredGlossary) {
+      startArgs.push("-Glossary", desiredGlossary);
+    }
+  }
 
-  // WhisperLiveKit does not expose its translation mode, so a leftover process
-  // is judged from what we started, plus what the ports show. Switching modes
-  // has to restart it: otherwise ASR-only keeps ignoring a freshly started
-  // llama.cpp, and translation mode keeps calling a server we just stopped.
-  if (wlkOnline && startedWlkMode !== desiredWlkMode) {
-    const modeSwitch =
-      desiredWlkMode === "asr-only" || !status.translation.online;
-    if (modeSwitch) {
-      pushLog(
-        desiredWlkMode === "asr-only"
+  // WhisperLiveKit does not expose its translation mode or glossary over HTTP,
+  // so a leftover process is judged from what we started, plus what the ports
+  // show. Switching modes or updating the server-side glossary has to restart
+  // it: otherwise WLK keeps running with stale CLI arguments.
+  const modeSwitch =
+    startedWlkMode !== desiredWlkMode &&
+    (desiredWlkMode === "asr-only" || !status.translation.online);
+  // An unknown signature (`null`) means the control service restarted while a
+  // WhisperLiveKit process survived, so its glossary is unknown too: restart to
+  // apply the current table, even when that table is now empty.
+  const glossarySwitch =
+    !asrOnly && startedGlossarySignature !== desiredGlossary;
+  if (wlkOnline && (modeSwitch || glossarySwitch)) {
+    pushLog(
+      modeSwitch
+        ? desiredWlkMode === "asr-only"
           ? "WhisperLiveKit 仍在翻译模式，重启为 ASR-only"
           : "WhisperLiveKit 可能仍运行在 ASR-only，重启以恢复翻译"
-      );
-      startArgs.push("-Restart");
-    }
+        : "术语库已变更，重启 WhisperLiveKit 以加载新术语表"
+    );
+    startArgs.push("-Restart");
   }
 
   job = {
     state: "starting",
     action: "start",
     translationMode: asrOnly ? "asr-only" : "translation",
+    glossarySignature: desiredGlossary,
     message: asrOnly
       ? `正在启动 ASR ${asrModel.label}（API 翻译，不启动本地翻译模型）`
       : `正在启动 ${translationModel.label} + ${asrModel.label}`,
@@ -463,6 +489,7 @@ async function handleStart(payload) {
     const finishedAt = Date.now();
     if (code === 0) {
       startedWlkMode = job.translationMode || null;
+      startedGlossarySignature = job.glossarySignature ?? "";
       job = { ...job, state: "finished", message: "本地服务已就绪", finishedAt, exitCode: code };
     } else {
       const tail = logTail.slice(-4).join(" | ");
@@ -503,7 +530,10 @@ async function handleStop() {
   };
   const result = await runStopServices();
   // Nothing is running any more, so the recorded WhisperLiveKit mode is void.
-  if (result.ok) startedWlkMode = null;
+  if (result.ok) {
+    startedWlkMode = null;
+    startedGlossarySignature = null;
+  }
   job = {
     ...job,
     state: result.ok ? "idle" : "error",

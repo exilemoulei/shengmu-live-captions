@@ -175,6 +175,38 @@
       </details>
 
       <details class="advanced">
+        <summary>术语库</summary>
+        <label class="switch-row">
+          <span>
+            <strong>启用术语库</strong>
+            <small>按句匹配专名注入翻译提示词，并为本地识别提供英文热词</small>
+          </span>
+          <input id="glossaryEnabled" type="checkbox">
+          <i aria-hidden="true"></i>
+        </label>
+        <label class="switch-row">
+          <span>
+            <strong>流放之路 (Path of Exile 1/2)</strong>
+            <small>内置 313 条国服解包官译：精魂、节杖、引路石、符文结界、焚界者、异界图鉴与同音纠错</small>
+          </span>
+          <input id="glossaryPresetPoe" type="checkbox">
+          <i aria-hidden="true"></i>
+        </label>
+        <p id="glossarySummaryHint" class="field-hint"></p>
+        <label for="glossaryDomainHint">领域背景提示</label>
+        <input id="glossaryDomainHint" type="text" spellcheck="false" maxlength="120" placeholder="例如：Path of Exile (流放之路) 游戏直播">
+        <label for="customGlossary">自定义术语（每行一条：英文 | 同音别名 -> 中文）</label>
+        <textarea id="customGlossary" rows="5" spellcheck="false" placeholder="Path of Exile | Path of Excel -> 流放之路&#10;Spirit -> 精魂&#10;SSF -> SSF"></textarea>
+        <div class="button-row glossary-actions">
+          <button id="importGlossaryButton" class="outline-button" type="button">导入 TXT/CSV</button>
+          <button id="exportGlossaryTextButton" class="outline-button" type="button">导出 TXT</button>
+          <button id="exportGlossaryCsvButton" class="outline-button" type="button">导出 CSV</button>
+        </div>
+        <input id="importGlossaryInput" type="file" accept=".txt,.csv,text/plain,text/csv" hidden>
+        <p id="glossaryActionHint" class="field-hint" hidden></p>
+      </details>
+
+      <details class="advanced">
         <summary>连接设置</summary>
         <label for="wsUrl">ASR WebSocket</label>
         <input id="wsUrl" type="url" spellcheck="false">

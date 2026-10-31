@@ -11,11 +11,13 @@ import {
   exportGlossaryText,
   matchGlossaryTerms,
   parseGlossaryText,
+  resolveEffectiveGlossary,
   serializeWlkGlossary
 } from "../extension/glossary.js";
 
 // Fixture terms are the ones named in the Path of Exile transcripts under
-// .research/poe-041; the shipped preset dictionaries are intentionally empty.
+// .research/poe-041; the shipped preset dictionary itself is exercised in a
+// dedicated test further down.
 const POE_FIXTURE = [
   "Path of Exile | Path of Excel | PoE -> 流放之路",
   "Spirit -> 精魂",
@@ -67,11 +69,17 @@ test("parseGlossaryText accepts arrow, equals, csv and alias syntax", () => {
 
 test("parseGlossaryText drops a pasted CSV header and quoted targets", () => {
   const entries = parseGlossaryText(
-    ['source,target', 'Chaos Orb,"混沌石, 通货"', 'Spirit,精魂'].join("\n")
+    [
+      "source,target,tgt_lng",
+      'Chaos Orb,"混沌石, 通货",zh-CN',
+      "Spirit,精魂,zh-CN",
+      "Oriath,奥瑞亚,"
+    ].join("\n")
   );
-  assert.equal(entries.length, 2);
+  assert.equal(entries.length, 3);
   assert.equal(entries[0].target, "混沌石, 通货");
   assert.deepEqual(entries[1], { sources: ["Spirit"], target: "精魂" });
+  assert.deepEqual(entries[2], { sources: ["Oriath"], target: "奥瑞亚" });
 });
 
 test("parseGlossaryText keeps the later line for a duplicated primary source", () => {
@@ -81,19 +89,51 @@ test("parseGlossaryText keeps the later line for a duplicated primary source", (
 });
 
 test("collectGlossaryEntries merges presets with custom text and lets custom win", () => {
-  // The shipped presets are empty shells, so the count comes from custom text.
-  assert.deepEqual(GLOSSARY_PRESETS.poe.entries, []);
+  assert.ok(GLOSSARY_PRESETS.poe.entries.length >= 60);
   const presetOnly = collectGlossaryEntries({ presetIds: ["poe"] });
-  assert.deepEqual(presetOnly, []);
+  assert.equal(presetOnly.length, GLOSSARY_PRESETS.poe.entries.length);
+  const spiritFromPreset = presetOnly.find(
+    (entry) => entry.sources[0].toLowerCase() === "spirit"
+  );
+  assert.equal(spiritFromPreset?.target, "精魂");
 
   const merged = collectGlossaryEntries({
     presetIds: ["poe", "does-not-exist"],
-    customText: "Spirit -> 精魂\nSpirit -> 精魄魂"
+    customText: "Spirit -> 精魄魂\nMyCustomTerm -> 自定义词"
   });
-  assert.deepEqual(merged, [{ sources: ["Spirit"], target: "精魄魂" }]);
+  assert.equal(merged.length, GLOSSARY_PRESETS.poe.entries.length + 1);
+  assert.equal(
+    merged.find((entry) => entry.sources[0].toLowerCase() === "spirit")?.target,
+    "精魄魂"
+  );
 
   const unknown = collectGlossaryEntries({ presetIds: ["nope"] });
   assert.deepEqual(unknown, []);
+});
+
+test("resolveEffectiveGlossary computes counts, domainHint and custom-first ASR entries", () => {
+  const active = resolveEffectiveGlossary({
+    glossaryEnabled: true,
+    glossaryPresetIds: ["poe"],
+    glossaryDomainHint: "",
+    customGlossary: "Zizaran -> 齐扎兰"
+  });
+  assert.equal(active.enabled, true);
+  assert.equal(active.presetCount, GLOSSARY_PRESETS.poe.entries.length);
+  assert.equal(active.customCount, 1);
+  assert.equal(active.domainHint, GLOSSARY_PRESETS.poe.domainHint);
+  assert.equal(active.asrEntries[0].sources[0], "Zizaran");
+
+  const disabled = resolveEffectiveGlossary({
+    glossaryEnabled: false,
+    glossaryPresetIds: ["poe"],
+    glossaryDomainHint: "自定义领域",
+    customGlossary: "Zizaran -> 齐扎兰"
+  });
+  assert.equal(disabled.enabled, false);
+  assert.deepEqual(disabled.entries, []);
+  assert.deepEqual(disabled.asrEntries, []);
+  assert.equal(disabled.domainHint, "");
 });
 
 test("matchGlossaryTerms folds English plurals and possessives", () => {
@@ -233,8 +273,10 @@ test("buildAsrContextPrompt keeps English sources only and respects the cap", ()
   assert.match(prompt, /Path of Exile/);
   assert.match(prompt, /Dominating Blow/);
   assert.match(prompt, /SSF/);
-  // Chinese targets and the alias list stay out of the ASR prompt.
+  // Chinese targets and homophone error aliases stay out of the ASR prompt.
   assert.doesNotMatch(prompt, /精魂/);
+  assert.doesNotMatch(prompt, /Path of Excel/);
+  assert.doesNotMatch(prompt, /Isamite/);
   assert.equal(prompt, buildAsrContextPrompt(entries));
 
   const short = buildAsrContextPrompt(entries, { maxChars: 20 });
@@ -378,5 +420,70 @@ test("exportGlossaryText round-trips through parseGlossaryText", () => {
   assert.equal(
     csv,
     'Chaos Orb,混沌石\nChaos,混沌石\nBone Ring,"骨环, 骸骨戒指"'
+  );
+});
+
+test("the shipped PoE preset matches the official Simplified Chinese client", () => {
+  const entries = GLOSSARY_PRESETS.poe.entries;
+  // Pinned on purpose: README, popup and paseo/12 all state this number, so a
+  // silent drift in the data file has to fail here instead of shipping.
+  assert.equal(entries.length, 313);
+
+  // Duplicate spellings would let the longest-first span masking drop an entry
+  // silently, and a source carrying `;`/`=`/`:` can never be expressed to WLK.
+  // Every spelling is checked, not just `sources[0]`: an alias that repeats
+  // another entry's primary spelling is just as silent.
+  const targets = new Map();
+  for (const entry of entries) {
+    assert.ok(entry.target.length > 0, entry.sources[0]);
+    assert.equal(entry.target.includes(";"), false, entry.target);
+    assert.equal(entry.target.includes("\n"), false, entry.target);
+    for (const source of entry.sources) {
+      assert.equal(/[;；:\r\n]|=|->/.test(source), false, source);
+      assert.equal(
+        targets.has(source.toLowerCase()),
+        false,
+        `${source} is listed twice`
+      );
+      targets.set(source.toLowerCase(), entry.target);
+    }
+  }
+
+  // Spot checks against poedb.tw/cn / poe2db.tw/cn page titles. PoE 2 wording
+  // wins where the two games disagree, and none of these may fall back to the
+  // old Taiwanese translations (卡尔葛, 释界, 链接石, 冰霜之捷, 诈欺师).
+  const targetOf = (source) => targets.get(source.toLowerCase());
+  assert.equal(targetOf("Kalguuran"), "卡古兰人");
+  assert.equal(targetOf("The Maven"), "贤主");
+  assert.equal(targetOf("The Searing Exarch"), "焚界者");
+  assert.equal(targetOf("Trickster"), "欺诈师");
+  assert.equal(targetOf("Herald of Ice"), "寒冰之捷");
+  assert.equal(targetOf("Quarterstaff"), "节杖");
+  assert.equal(targetOf("Harvest"), "庄园");
+  assert.equal(targetOf("Jeweller's Orb"), "工匠石");
+  assert.equal(targetOf("Orb of Fusing"), "链结石");
+  assert.equal(targetOf("Charges"), "能量球");
+
+  // The first tier exists only to bias Whisper, so those names must survive the
+  // 360-character cut while homophone aliases must never reach the decoder.
+  const asr = buildAsrContextPrompt(entries);
+  assert.ok(asr.length <= MAX_ASR_CONTEXT_CHARS);
+  for (const name of ["Wraeclast", "Ezomyte", "Kalguuran", "Kalandra", "Xesht", "Sekhemas"]) {
+    assert.ok(asr.includes(name), `${name} fell out of the ASR budget`);
+  }
+  assert.equal(asr.includes("Path of Excel"), false);
+  assert.equal(asr.includes("Isamite"), false);
+});
+
+test("the PoE preset trades everyday polysemy for live coverage", () => {
+  // Breach / Expedition / Harvest / Ritual / Legion / Rage are ordinary English
+  // words as well. Dropping them would lose the league names a PoE stream says
+  // every few minutes, so they stay; this test documents the cost instead of
+  // pretending a domain gate exists (see GLOSSARY-ISSUES.md, item 5).
+  const entries = GLOSSARY_PRESETS.poe.entries;
+  const hits = matchGlossaryTerms(["there is a breach in the wall"], entries);
+  assert.deepEqual(
+    hits.map((hit) => `${hit.matched}=${hit.target}`),
+    ["breach=裂隙"]
   );
 });

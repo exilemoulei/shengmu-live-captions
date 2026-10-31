@@ -19,6 +19,10 @@ import {
   settingsForCaptions
 } from "./caption-utils.js";
 import {
+  buildAsrContextPrompt,
+  resolveEffectiveGlossary
+} from "./glossary.js";
+import {
   TRANSLATION_PROVIDERS,
   isAbortError,
   normalizeTranslationBaseUrl,
@@ -246,7 +250,11 @@ function translationSettingsChanged(patch = {}) {
     "translationModel",
     "translationApiKeys",
     "translationTranslatePartial",
-    "translationTimeoutMs"
+    "translationTimeoutMs",
+    "glossaryEnabled",
+    "glossaryPresetIds",
+    "glossaryDomainHint",
+    "customGlossary"
   ].some((key) => key in patch);
 }
 
@@ -541,7 +549,27 @@ function compactText(value) {
 }
 
 function translationConfig() {
-  return resolveTranslationConfig(settingsCache);
+  const base = resolveTranslationConfig(settingsCache);
+  const glossary = resolveEffectiveGlossary(settingsCache);
+  return {
+    ...base,
+    glossaryEntries: glossary.entries,
+    domainHint: glossary.domainHint
+  };
+}
+
+function buildSessionWsUrl(baseWsUrl, settings = settingsCache) {
+  const url = new URL(baseWsUrl);
+  const glossary = resolveEffectiveGlossary(settings);
+  const asrContext = glossary.enabled
+    ? buildAsrContextPrompt(glossary.asrEntries)
+    : "";
+  if (asrContext) {
+    url.searchParams.set("context", asrContext);
+  } else {
+    url.searchParams.delete("context");
+  }
+  return url.toString();
 }
 
 function apiTranslationActive() {
@@ -1178,7 +1206,7 @@ async function startSession(message) {
       sessionId,
       targetTabId: message.targetTabId,
       streamId: message.streamId,
-      wsUrl
+      wsUrl: buildSessionWsUrl(wsUrl, settingsCache)
     });
     if (!result?.ok) throw new Error(result?.error || "音频采集启动失败");
   } catch (error) {

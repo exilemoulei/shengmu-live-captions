@@ -439,7 +439,8 @@ h1 {
 select,
 input[type="url"],
 input[type="text"],
-input[type="password"] {
+input[type="password"],
+textarea {
   width: 100%;
   padding: 7px 9px;
   border: 1px solid var(--line);
@@ -451,10 +452,20 @@ input[type="password"] {
   font-size: 11px;
 }
 
+textarea {
+  resize: vertical;
+  min-height: 86px;
+  max-height: 220px;
+  line-height: 1.45;
+  font-family: Consolas, "Microsoft YaHei UI", monospace;
+  font-size: 10px;
+}
+
 select:focus,
 input[type="url"]:focus,
 input[type="text"]:focus,
-input[type="password"]:focus {
+input[type="password"]:focus,
+textarea:focus {
   border-color: var(--green);
   box-shadow: 0 0 0 2px rgba(71, 114, 90, 0.12);
 }
@@ -554,11 +565,24 @@ output {
   padding-bottom: 4px;
 }
 
-.advanced label {
+.advanced label:not(.switch-row) {
   display: block;
   margin: 10px 0 5px;
   color: var(--muted);
   font-size: 9px;
+}
+
+.advanced .switch-row {
+  margin-top: 8px;
+}
+
+.glossary-actions {
+  grid-template-columns: 1.2fr 1fr 1fr;
+}
+
+.outline-button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .outline-button {

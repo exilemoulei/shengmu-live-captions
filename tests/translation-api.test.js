@@ -244,6 +244,45 @@ test("buildTranslationRequestBody includes DeepSeek thinking-off and segments", 
   assert.equal("thinking" in withoutThinking, false);
 });
 
+test("buildTranslationRequestBody injects only matched glossary terms and domain hint", () => {
+  const config = deepseekConfig("https://api.deepseek.com/v1");
+  const glossaryEntries = [
+    { sources: ["Path of Exile", "Path of Excel"], target: "流放之路" },
+    { sources: ["Spirit"], target: "精魂" },
+    { sources: ["Chaos Orb"], target: "混沌石" }
+  ];
+
+  // Unmatched segments with no domain hint leave the request payload untouched.
+  const plain = buildTranslationRequestBody({
+    texts: ["Yes, wait a second."],
+    context: [{ source: "Spirit is full", translation: "精魂满了" }],
+    config,
+    glossaryEntries
+  });
+  const plainPayload = JSON.parse(plain.messages[1].content);
+  assert.equal("glossary" in plainPayload, false);
+  assert.doesNotMatch(plain.messages[0].content, /glossary|当前直播领域/);
+
+  // Matched segments inject only the hit entries (keyed by the ASR spelling)
+  // and append the domain/glossary rules to the system prompt.
+  const matched = buildTranslationRequestBody({
+    texts: ["Welcome to path of excel, your spirit is low."],
+    config,
+    partial: true,
+    glossaryEntries,
+    domainHint: "Path of Exile (流放之路) 游戏直播"
+  });
+  const matchedPayload = JSON.parse(matched.messages[1].content);
+  assert.deepEqual(matchedPayload.glossary, {
+    "path of excel": "流放之路",
+    spirit: "精魂"
+  });
+  assert.equal("Chaos Orb" in matchedPayload.glossary, false);
+  assert.match(matched.messages[0].content, /5\. 当前输入是实时字幕里尚未定稿的半句/);
+  assert.match(matched.messages[0].content, /6\. 当前直播领域：Path of Exile \(流放之路\) 游戏直播/);
+  assert.match(matched.messages[0].content, /7\. 必须严格使用输入 glossary 中的术语译名/);
+});
+
 test("parseTranslationOutput handles JSON, code fences, objects and numbered lines", () => {
   assert.deepEqual(parseTranslationOutput('["你好","再见"]', 2), ["你好", "再见"]);
   assert.deepEqual(

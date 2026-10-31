@@ -5,6 +5,15 @@ import {
   normalizeWsUrl
 } from "./caption-utils.js";
 import {
+  GLOSSARY_PRESETS,
+  MAX_CUSTOM_GLOSSARY_CHARS,
+  collectGlossaryEntries,
+  exportGlossaryText,
+  parseGlossaryText,
+  resolveEffectiveGlossary,
+  serializeWlkGlossary
+} from "./glossary.js";
+import {
   TRANSLATION_PROVIDERS,
   normalizeTranslationBaseUrl
 } from "./translation-api.js";
@@ -46,6 +55,16 @@ const elements = {
   clearTranslationKey: document.querySelector("#clearTranslationKey"),
   translationTestResult: document.querySelector("#translationTestResult"),
   translationUsage: document.querySelector("#translationUsage"),
+  glossaryEnabled: document.querySelector("#glossaryEnabled"),
+  glossaryPresetPoe: document.querySelector("#glossaryPresetPoe"),
+  glossarySummaryHint: document.querySelector("#glossarySummaryHint"),
+  glossaryDomainHint: document.querySelector("#glossaryDomainHint"),
+  customGlossary: document.querySelector("#customGlossary"),
+  importGlossaryButton: document.querySelector("#importGlossaryButton"),
+  importGlossaryInput: document.querySelector("#importGlossaryInput"),
+  exportGlossaryTextButton: document.querySelector("#exportGlossaryTextButton"),
+  exportGlossaryCsvButton: document.querySelector("#exportGlossaryCsvButton"),
+  glossaryActionHint: document.querySelector("#glossaryActionHint"),
   openMonitor: document.querySelector("#openMonitor"),
   openMonitorFooter: document.querySelector("#openMonitorFooter"),
   localServiceBadge: document.querySelector("#localServiceBadge"),
@@ -117,6 +136,29 @@ function createSliderSaver(delayMs, save) {
 
 const fontSlider = createSliderSaver(180, (value) => savePatch({ fontSize: value }));
 const opacitySlider = createSliderSaver(180, (value) => savePatch({ opacity: value }));
+const domainHintSaver = createSliderSaver(300, (value) =>
+  savePatch({ glossaryDomainHint: value })
+);
+const customGlossarySaver = createSliderSaver(360, (value) =>
+  savePatch({ customGlossary: value })
+);
+
+function setGlossaryActionHint(text = "") {
+  elements.glossaryActionHint.textContent = text;
+  elements.glossaryActionHint.hidden = !text;
+}
+
+function collectGlossaryPatchFromInputs() {
+  return {
+    glossaryEnabled: elements.glossaryEnabled.checked,
+    glossaryPresetIds: elements.glossaryPresetPoe.checked ? ["poe"] : [],
+    glossaryDomainHint: elements.glossaryDomainHint.value.trim(),
+    customGlossary: elements.customGlossary.value.slice(
+      0,
+      MAX_CUSTOM_GLOSSARY_CHARS
+    )
+  };
+}
 
 function setLocalNotice(text) {
   local.notice = text || "";
@@ -213,6 +255,7 @@ function render() {
   elements.openPanelOnStart.checked = settings.openPanelOnStart;
   elements.wsUrl.value = settings.wsUrl;
   renderTranslationSettings();
+  renderGlossarySettings();
 }
 
 function setFieldValue(element, value) {
@@ -272,6 +315,55 @@ function renderTranslationSettings() {
     usageText += ` · ${String(translationState.error).slice(0, 90)}`;
   }
   elements.translationUsage.textContent = usageText;
+}
+
+function updateGlossarySummaryText(draftSettings = settings) {
+  const effective = resolveEffectiveGlossary(draftSettings);
+  if (effective.enabled) {
+    let summary =
+      `已生效 ${effective.entries.length} 条术语` +
+      `（内置 ${effective.presetCount} · 自定义 ${effective.customCount}）`;
+    if (effective.domainHint) {
+      summary += ` · 领域：${effective.domainHint}`;
+    }
+    elements.glossarySummaryHint.textContent = summary;
+  } else {
+    elements.glossarySummaryHint.textContent =
+      `术语库已关闭（已保存内置 ${effective.presetCount} · 自定义 ${effective.customCount}）`;
+  }
+  const customEntries = parseGlossaryText(draftSettings.customGlossary);
+  const hasExportable =
+    effective.entries.length > 0 || customEntries.length > 0;
+  elements.exportGlossaryTextButton.disabled = !hasExportable;
+  elements.exportGlossaryCsvButton.disabled = !hasExportable;
+}
+
+function renderGlossarySettings() {
+  const presetIds = Array.isArray(settings.glossaryPresetIds)
+    ? settings.glossaryPresetIds
+    : [];
+  const poeChecked = presetIds.includes("poe");
+  elements.glossaryEnabled.checked = settings.glossaryEnabled !== false;
+  elements.glossaryPresetPoe.checked = poeChecked;
+  elements.glossaryDomainHint.placeholder = poeChecked
+    ? GLOSSARY_PRESETS.poe.domainHint
+    : "例如：Path of Exile (流放之路) 游戏直播";
+  if (!domainHintSaver.busy()) {
+    setFieldValue(
+      elements.glossaryDomainHint,
+      settings.glossaryDomainHint || ""
+    );
+  }
+  if (!customGlossarySaver.busy()) {
+    setFieldValue(elements.customGlossary, settings.customGlossary || "");
+  }
+  updateGlossarySummaryText({
+    ...settings,
+    glossaryEnabled: elements.glossaryEnabled.checked,
+    glossaryPresetIds: poeChecked ? ["poe"] : [],
+    glossaryDomainHint: elements.glossaryDomainHint.value,
+    customGlossary: elements.customGlossary.value
+  });
 }
 
 function formatBytes(bytes) {
@@ -582,9 +674,14 @@ async function startLocalServices() {
   setLocalNotice("");
   renderLocal();
   try {
+    await savePatch(collectGlossaryPatchFromInputs());
     const apiKeyConfigured = Boolean(
       settings.translationApiKeyConfigured?.[settings.translationProvider]
     );
+    const effectiveGlossary = resolveEffectiveGlossary(settings);
+    const wlkGlossary = effectiveGlossary.enabled
+      ? serializeWlkGlossary(effectiveGlossary.entries)
+      : "";
     const payload = await localRequest("/start", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -592,7 +689,8 @@ async function startLocalServices() {
         translationModel: settings.localTranslationModel,
         asrModel: settings.localAsrModel,
         translationMode: settings.translationMode,
-        apiTranslationConfigured: apiKeyConfigured
+        apiTranslationConfigured: apiKeyConfigured,
+        glossary: wlkGlossary
       }),
       timeoutMs: 15000
     });
@@ -681,13 +779,14 @@ async function startCapture() {
   if (!/^https?:/i.test(activeTab.url || "")) {
     throw new Error("此页面不支持标签页音频采集，请打开直播或视频网页");
   }
-  // Persist visible translation fields before starting: a click blurs the key
-  // input, and the asynchronous change handler may otherwise lose the race
-  // with start-capture.
+  // Persist visible translation and glossary fields before starting: a click
+  // blurs the active input, and an asynchronous change/debounce handler may
+  // otherwise lose the race with start-capture.
   const patch = {
     wsUrl: normalizeWsUrl(elements.wsUrl.value),
     translationMode: elements.translationMode.value,
-    translationTranslatePartial: elements.translationTranslatePartial.checked
+    translationTranslatePartial: elements.translationTranslatePartial.checked,
+    ...collectGlossaryPatchFromInputs()
   };
   if (patch.translationMode === "api") {
     const provider = elements.translationProvider.value;
@@ -905,7 +1004,8 @@ elements.testTranslationButton.addEventListener("click", async () => {
       translationMode: elements.translationMode.value,
       translationProvider: provider,
       translationBaseUrl: baseUrl,
-      translationModel: elements.translationModel.value.trim()
+      translationModel: elements.translationModel.value.trim(),
+      ...collectGlossaryPatchFromInputs()
     };
     if (!patch.translationModel) throw new Error("请填写翻译模型");
     const pendingKey = elements.translationApiKey.value.trim();
@@ -1005,6 +1105,179 @@ elements.copyLocalServiceCommand.addEventListener("click", () => {
 elements.retryLocalService.addEventListener("click", () => {
   setLocalNotice("正在重新检测本地控制服务…");
   void pollLocal();
+});
+
+function notifyGlossaryRuntimeEffect() {
+  if (
+    settings.translationMode === "server" &&
+    local.serviceOnline &&
+    local.status?.services?.asr?.online
+  ) {
+    setGlossaryActionHint(
+      "本地服务端翻译需点上方“一键启动”重载术语表；ASR 热词在下次开始字幕时生效"
+    );
+    return;
+  }
+  if (runtimeState?.active) {
+    setGlossaryActionHint(
+      "API 翻译已实时应用新术语；ASR 识别热词将在下次开始字幕时生效"
+    );
+    return;
+  }
+  setGlossaryActionHint("");
+}
+
+elements.glossaryEnabled.addEventListener("change", () => {
+  void savePatch({ glossaryEnabled: elements.glossaryEnabled.checked })
+    .then(() => notifyGlossaryRuntimeEffect())
+    .catch((error) => setError(error.message));
+});
+
+elements.glossaryPresetPoe.addEventListener("change", () => {
+  const presetIds = elements.glossaryPresetPoe.checked ? ["poe"] : [];
+  void savePatch({ glossaryPresetIds: presetIds })
+    .then(() => notifyGlossaryRuntimeEffect())
+    .catch((error) => setError(error.message));
+});
+
+elements.glossaryDomainHint.addEventListener("input", () => {
+  const value = elements.glossaryDomainHint.value.trim();
+  updateGlossarySummaryText({
+    ...settings,
+    ...collectGlossaryPatchFromInputs()
+  });
+  domainHintSaver.push(value);
+});
+
+elements.glossaryDomainHint.addEventListener("change", () => {
+  void savePatch({
+    glossaryDomainHint: elements.glossaryDomainHint.value.trim()
+  })
+    .then(() => notifyGlossaryRuntimeEffect())
+    .catch((error) => setError(error.message));
+});
+
+elements.customGlossary.addEventListener("input", () => {
+  const value = elements.customGlossary.value.slice(
+    0,
+    MAX_CUSTOM_GLOSSARY_CHARS
+  );
+  updateGlossarySummaryText({
+    ...settings,
+    ...collectGlossaryPatchFromInputs()
+  });
+  customGlossarySaver.push(value);
+});
+
+elements.customGlossary.addEventListener("change", () => {
+  const value = elements.customGlossary.value.slice(
+    0,
+    MAX_CUSTOM_GLOSSARY_CHARS
+  );
+  void savePatch({ customGlossary: value })
+    .then(() => notifyGlossaryRuntimeEffect())
+    .catch((error) => setError(error.message));
+});
+
+elements.importGlossaryButton.addEventListener("click", () => {
+  elements.importGlossaryInput.value = "";
+  elements.importGlossaryInput.click();
+});
+
+elements.importGlossaryInput.addEventListener("change", async () => {
+  const file = elements.importGlossaryInput.files?.[0];
+  if (!file) return;
+  setError();
+  try {
+    if (file.size > 512 * 1024) {
+      throw new Error("术语文件过大（超过 512 KB），请精简后再导入");
+    }
+    const rawText = await file.text();
+    const imported = parseGlossaryText(rawText);
+    if (imported.length === 0) {
+      throw new Error(
+        "未在文件中识别到有效术语（格式：英文 -> 中文 或 CSV source,target）"
+      );
+    }
+    const merged = collectGlossaryEntries({
+      presetIds: [],
+      customText: `${elements.customGlossary.value || ""}\n${rawText}`
+    });
+    // 32 KB is a hard storage cap, so truncation must happen on whole entries and
+    // be reported: slicing the serialised text would cut a term in half and still
+    // claim every imported row was kept.
+    const fullText = exportGlossaryText(merged, "text");
+    let nextText = fullText;
+    let dropped = 0;
+    if (fullText.length > MAX_CUSTOM_GLOSSARY_CHARS) {
+      const keptLines = [];
+      let used = 0;
+      for (const line of fullText.split("\n")) {
+        const addition = line.length + (keptLines.length > 0 ? 1 : 0);
+        if (used + addition > MAX_CUSTOM_GLOSSARY_CHARS) break;
+        keptLines.push(line);
+        used += addition;
+      }
+      if (keptLines.length === 0) {
+        throw new Error(
+          "自定义术语已达 32 KB 上限，无法再导入，请先精简现有词条后重试"
+        );
+      }
+      nextText = keptLines.join("\n");
+      dropped = merged.length - keptLines.length;
+    }
+    elements.customGlossary.value = nextText;
+    await savePatch({ customGlossary: nextText });
+    setGlossaryActionHint(
+      dropped > 0
+        ? `已从 ${file.name} 识别 ${imported.length} 条；受 32 KB 上限限制仅保留前 ${nextText.split("\n").length} 条（丢弃 ${dropped} 条，原有词条优先）`
+        : `已从 ${file.name} 导入 ${imported.length} 条，自定义术语共 ${merged.length} 条`
+    );
+  } catch (error) {
+    setError(error?.message || String(error));
+  }
+});
+
+function downloadGlossaryFile(format) {
+  const draft = {
+    ...settings,
+    ...collectGlossaryPatchFromInputs()
+  };
+  const effective = resolveEffectiveGlossary(draft);
+  const entries =
+    effective.entries.length > 0
+      ? effective.entries
+      : parseGlossaryText(draft.customGlossary);
+  if (entries.length === 0) {
+    setError("当前没有可导出的术语词条");
+    return;
+  }
+  const isCsv = format === "csv";
+  const body = isCsv
+    ? `source,target\n${exportGlossaryText(entries, "csv")}\n`
+    : `${exportGlossaryText(entries, "text")}\n`;
+  const blob = new Blob([body], {
+    type: isCsv ? "text/csv;charset=utf-8" : "text/plain;charset=utf-8"
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = isCsv ? "shengmu-glossary.csv" : "shengmu-glossary.txt";
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  setGlossaryActionHint(
+    `已导出 ${entries.length} 条术语（${isCsv ? "CSV" : "TXT"}）`
+  );
+}
+
+elements.exportGlossaryTextButton.addEventListener("click", () => {
+  downloadGlossaryFile("text");
+});
+
+elements.exportGlossaryCsvButton.addEventListener("click", () => {
+  downloadGlossaryFile("csv");
 });
 
 chrome.runtime.onMessage.addListener((message) => {

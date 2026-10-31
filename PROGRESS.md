@@ -1,5 +1,48 @@
 # 项目进度记录 (PROGRESS.md)
 
+## 2026-10-31 · 0.5.4：术语库全链路 + 《流放之路》313 条国服词库定稿
+
+设计/验收记录：`paseo/11-glossary-0.5.3.md`（链路）、`paseo/12-poe-glossary-0.5.4.md`（词库数据与判据）、`GLOSSARY-ISSUES.md`（框架问题复核）。两部分改动合并在 0.5.4 交付：链路由上一会话完成、词库由本会话定稿。
+
+### 术语链路（上一会话，未提交）
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\extension\translation-api.js`：新增 `buildSystemPrompt`（部分译文提示、领域背景、术语硬约束三条按需追加）；`buildTranslationRequestBody` 用 `matchGlossaryTerms` 按当前 batch 命中后注入 `glossary` 映射，未命中且无领域提示时请求体与 0.5.3 一致；`translateTexts` 透传 `glossaryEntries` / `domainHint`。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\extension\service-worker.js`：`translationConfig()` 附带 `glossaryEntries`、`domainHint`；新增 `buildSessionWsUrl` 把 `buildAsrContextPrompt` 结果写进 WS `?context=`（关闭术语库时删除该参数）；术语设置变更纳入 `translationSettingsChanged`。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\scripts\local-service\server.mjs`：`POST /start` 接收 `glossary`，经 `sanitizeWlkGlossary`（去控制字符、压空白、截 4000）后传 `-Glossary`；新增 `startedGlossarySignature`，术语表变化或模式切换时补 `-Restart`；`/stop` 与异常路径清空签名。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\extension\popup.html` `popup.js` `popup.css`：新增「术语库」折叠区（总开关、PoE 预设勾选、生效条数摘要、领域提示、自定义多行框、TXT/CSV 导入导出）；启动采集与「一键启动」前强制同步术语字段；本地服务端模式下提示需重载才能生效。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\tests\translation-api.test.js` `tests\service-worker.integration.test.js`：+4 例覆盖提示词注入、按批命中、mock API 往返。
+
+### 词库定稿（本会话）
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\extension\glossary-poe.js`（新增，345 行）：`POE_PRESET_ENTRIES` 313 条，覆盖世界观/种族/首领 35、职业与升华 55、通货与制作 55、核心机制 37、装备宝石药剂基底 39、基石天赋 15、技能宝石 38、终局赛季 24、顶流传奇 12、游戏模式 3。全部译名取自 `poe2db.tw/cn`（优先）与 `poedb.tw/cn` 条目页 `<title>`，分类页取同站导航，概念词用含该机制的技能/关键字页正文佐证。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\extension\glossary.js`：删除内联的 97 条 `POE_PRESET_ENTRIES`，改为从 `glossary-poe.js` 引入（文件回落到 493 行，数据与逻辑分离）。其余逻辑未动。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\extension\popup.html`：PoE 预设描述改为词库实际内容（节杖、引路石、符文结界、焚界者、异界图鉴、313 条）。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\tests\glossary.test.js`：新增「shipped PoE preset matches the official Simplified Chinese client」1 例（条数 ≥300、主拼写与别名去重、target 无 `;`/换行、源词无 WLK 不可表达的 `;`/`=`/`->`、10 条国服译名抽查、ASR 预算内必须含 6 个高危专名且不得含同音错词）。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\GLOSSARY-ISSUES.md`：追加「0.5.4 复核」表，逐条标注框架问题 1/2 已修或已规避、3/7 仍存在、4/5/6 已规避或定口径。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\package.json` `extension\manifest.json`：0.5.3 → 0.5.4。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\AGENTS.md` `README.md`：版本号、文档锚点、`npm test` 数量、分层表新增 `glossary-poe.js`、新增「词库数据红线」一条。
+- `C:\Users\moule\Documents\ChatGPT\实时字幕翻译\paseo\12-poe-glossary-0.5.4.md`（新增）：数据来源与判据、三梯队与预算实测、别名策略、剔除词、已知分歧、验证结果。
+
+### 已执行验证
+- `npm test`：92 项全通过（0.5.3 的 90 项 + 预设数据校验与多义取舍 2 项）。
+- `node --check`：`extension/*.js`、`scripts/local-service/server.mjs`、`tests/*.js` 全通过。
+- 词库规模与预算：313 条；`buildAsrContextPrompt` 357 字符（上限 360，装入前 35 条专名，`Wraeclast` 到 `Warrior`）；`serializeWlkGlossary` 4000 字符 / 200 对（上限 4000，恰好触顶，覆盖前约 150 条词条）。
+- 真实语料冒烟（`.research/poe-041/transcripts.md` 77 行英文）：11 行命中、15 次命中，含 `Path of Exile`、`PoE2`、`dominating blow`、`convoking wand`、`bone rings`、`scepter`、`spirit`、`Isamite`、`orb of augmentation`。
+
+### 未执行 / 待后续
+- 未做浏览器实测：本次词库为纯数据改动，链路需在 Dev 浏览器或真实直播里复测一次（术语是否按预期出现在 API 请求与浮层译文）。
+- 未拆 PoE 1 / PoE 2 预设包：同名不同译统一按 PoE 2 口径，若后续以一代直播为主需再评估。
+- WLK 4000 字符只覆盖前约 150 条，后半截仅靠按句匹配生效；要彻底解决需取消启动参数静态全量传参（记在 `GLOSSARY-ISSUES.md` 第 3 条）。
+- 未补集成测试：`server.mjs` 的术语签名重启判定与 WS `?context=` 的开关仍靠 `node --check` 与人工核对。
+
+### 跨模型审阅（GPT-6 Luna，`review=code review`）
+- 结论：有阻塞（1 个 P1），修完后可提交。完整分级表见 `paseo/12-poe-glossary-0.5.4.md` §9。
+- P1（已修）：`popup.js` 导入术语文件允许 512 KB，却把序列化结果直接 `slice(0, 32 KB)`，超限会截断在词条中间且仍报「导入 N 条」。改为按整行截取，报告保留/丢弃条数，一条都放不下时直接报错不落库。
+- P2（已修）：`server.mjs` 的 `startedGlossarySignature` 为 `null`（控制服务重启、WLK 仍在线）且当前词表为空时不重启，旧词表会继续生效 —— 去掉 `null` 特判，签名不符即 `-Restart`。
+- P2（已修）：`Kalguur` 曾被当作 `Kalguuran` 的同义拼写（卡古兰人），会把地名误改成人群称谓，已移除别名。
+- P2（已修）：测试只查主拼写重复、条数只断言 ≥300 —— 改为遍历全部 `sources` 查重并锁定 313 条。
+- P2（记录不改）：`translation-api.js` 依赖 `glossary.js` 属可复用的领域纯函数（零 `chrome.*`/DOM），已在 `AGENTS.md` 分层表写明属例外。
+- P2（记录不改）：`Spirit Gem`＝精神宝石、`Uncut Spirit Gem`＝未切割的精魂宝石 是解包自身不一致，词库照抄；`Breach`/`Expedition`/`Harvest`/`Ritual`/`Legion`/`Rage` 的日常词误命中用测试写死（直播语境优先）。
+- 顺带修正：`Lineage Support` 改用条目页全称「血脉辅助宝石」。
+
 ## 2026-10-31 · 0.5.3：术语库基建（解析/匹配/序列化 + 设置字段，不含术语表内容）
 
 设计/验收记录：`paseo/11-glossary-0.5.3.md`。范围由用户拍板：只做基建层，内置 PoE 预设留空壳，popup 面板 / 翻译注入 / ASR context / `-Glossary` 打通留到下一步。

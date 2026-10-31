@@ -300,3 +300,51 @@ test("content scripts cannot force overlay re-injection", async () => {
   assert.equal(response.ok, false);
   assert.match(response.error, /扩展界面|拒绝/);
 });
+
+test("service worker injects active glossary and domain hint into API requests", async () => {
+  const api = await startMockApi();
+  try {
+    await sendToBackground({
+      target: "background",
+      type: "save-settings",
+      settings: {
+        translationMode: "api",
+        translationProvider: "custom",
+        translationBaseUrl: api.url,
+        translationModel: "mock-translate",
+        translationApiKeys: { custom: "secret-key" },
+        glossaryEnabled: true,
+        glossaryPresetIds: ["poe"],
+        glossaryDomainHint: "",
+        customGlossary: "live stream -> 直播间"
+      }
+    });
+    const response = await sendToBackground({
+      target: "background",
+      type: "test-translation-api"
+    });
+    assert.equal(response.ok, true);
+    assert.equal(api.requests.length, 1);
+    const [systemMsg, userMsg] = api.requests[0].body.messages;
+    assert.match(systemMsg.content, /Path of Exile \(流放之路\) 游戏直播/);
+    const userPayload = JSON.parse(userMsg.content);
+    assert.deepEqual(userPayload.glossary, { "live stream": "直播间" });
+
+    await sendToBackground({
+      target: "background",
+      type: "save-settings",
+      settings: { glossaryEnabled: false }
+    });
+    const disabledResp = await sendToBackground({
+      target: "background",
+      type: "test-translation-api"
+    });
+    assert.equal(disabledResp.ok, true);
+    assert.equal(api.requests.length, 2);
+    const [disabledSys, disabledUser] = api.requests[1].body.messages;
+    assert.doesNotMatch(disabledSys.content, /当前直播领域/);
+    assert.equal("glossary" in JSON.parse(disabledUser.content), false);
+  } finally {
+    await api.close();
+  }
+});

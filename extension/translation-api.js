@@ -6,6 +6,8 @@
  * unit-tested with Node's built-in test runner and fetch.
  */
 
+import { buildGlossaryMap, matchGlossaryTerms } from "./glossary.js";
+
 export const DEFAULT_TRANSLATION_MODE = "api";
 export const DEFAULT_TRANSLATION_PROVIDER = "deepseek";
 export const DEFAULT_TRANSLATION_TIMEOUT_MS = 12000;
@@ -236,11 +238,38 @@ export function recentTranslationContext(
   return context;
 }
 
+function buildSystemPrompt({ partial = false, domainHint = "", hasGlossary = false } = {}) {
+  const lines = [SYSTEM_PROMPT];
+  let ruleNumber = 5;
+  if (partial) {
+    lines.push(`${ruleNumber}. ${PARTIAL_HINT}`);
+    ruleNumber += 1;
+  }
+  const cleanDomain = String(domainHint ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+  if (cleanDomain) {
+    lines.push(
+      `${ruleNumber}. 当前直播领域：${cleanDomain}。请结合该领域语境翻译，并自动修正明显的语音识别同音错词。`
+    );
+    ruleNumber += 1;
+  }
+  if (hasGlossary) {
+    lines.push(
+      `${ruleNumber}. 必须严格使用输入 glossary 中的术语译名（若译名与源词相同则保留英文原文）；仅在对应词出现时使用，不要输出或解释术语表。`
+    );
+  }
+  return lines.join("\n");
+}
+
 export function buildTranslationRequestBody({
   texts,
   context = [],
   config,
   partial = false,
+  glossaryEntries = [],
+  domainHint = "",
   includeThinking = true,
   includeTemperature = true,
   tokenField = "max_tokens"
@@ -256,10 +285,25 @@ export function buildTranslationRequestBody({
   if (!model) {
     throw new TranslationApiError("尚未填写翻译模型", { code: "config" });
   }
+  const effectiveEntries =
+    Array.isArray(glossaryEntries) && glossaryEntries.length > 0
+      ? glossaryEntries
+      : config?.glossaryEntries || [];
+  const effectiveDomainHint =
+    domainHint || config?.domainHint || "";
+  const glossaryMap = buildGlossaryMap(
+    matchGlossaryTerms(segments, effectiveEntries)
+  );
+  const hasGlossary = Object.keys(glossaryMap).length > 0;
   const maxTokens = Math.min(
     2048,
     Math.max(128, segments.length * 128 + 64)
   );
+  const userPayload = {
+    ...(hasGlossary ? { glossary: glossaryMap } : {}),
+    context: Array.isArray(context) ? context.slice(-DEFAULT_CONTEXT_LINES) : [],
+    segments
+  };
   const body = {
     model,
     [tokenField]: maxTokens,
@@ -267,14 +311,15 @@ export function buildTranslationRequestBody({
     messages: [
       {
         role: "system",
-        content: partial ? `${SYSTEM_PROMPT}\n5. ${PARTIAL_HINT}` : SYSTEM_PROMPT
+        content: buildSystemPrompt({
+          partial,
+          domainHint: effectiveDomainHint,
+          hasGlossary
+        })
       },
       {
         role: "user",
-        content: JSON.stringify({
-          context: Array.isArray(context) ? context.slice(-DEFAULT_CONTEXT_LINES) : [],
-          segments
-        })
+        content: JSON.stringify(userPayload)
       }
     ]
   };
@@ -540,6 +585,8 @@ export async function translateTexts({
   context = [],
   config,
   partial = false,
+  glossaryEntries = [],
+  domainHint = "",
   fetchImpl = globalThis.fetch,
   signal = null
 } = {}) {
@@ -572,6 +619,8 @@ export async function translateTexts({
         context,
         config: resolved,
         partial,
+        glossaryEntries,
+        domainHint,
         includeThinking,
         includeTemperature,
         tokenField
