@@ -42,6 +42,7 @@
 - P2（记录不改）：`translation-api.js` 依赖 `glossary.js` 属可复用的领域纯函数（零 `chrome.*`/DOM），已在 `AGENTS.md` 分层表写明属例外。
 - P2（记录不改）：`Spirit Gem`＝精神宝石、`Uncut Spirit Gem`＝未切割的精魂宝石 是解包自身不一致，词库照抄；`Breach`/`Expedition`/`Harvest`/`Ritual`/`Legion`/`Rage` 的日常词误命中用测试写死（直播语境优先）。
 - 顺带修正：`Lineage Support` 改用条目页全称「血脉辅助宝石」。
+- 已提交：`ead7c47` `feat(0.5.4): ship the Path of Exile glossary and wire it into both engines`（GPG 签名验签 Good signature，16 文件 +1230/−101）。未 push：按规范需用户明确指令才推。
 
 ## 2026-10-31 · 0.5.3：术语库基建（解析/匹配/序列化 + 设置字段，不含术语表内容）
 
