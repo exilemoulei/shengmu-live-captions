@@ -22,7 +22,7 @@
 ### 未执行 / 待后续决定
 - 跨模型审阅（GPT-6 Luna）已完成：无 P0，1 个 P1、6 个 P2；P1 与 5 个 P2 已修并重测，剩 1 个 P2（ASR-only 下 API 失败时 popup 仍显示“实时翻译中”）记入 backlog。详见 `paseo/10-asr-width-opacity-0.5.2.md` §8。
 - 最终浏览器复测在 `scripts/Start-DevBrowser.ps1`（Chrome + `chrome-profile`）上完成，未再打断 Helium 里的直播；Helium 侧由用户自行观察。
-- 未提交、未 `git push`；`.research/`、`tests/`、`paseo/`、`AGENTS.md` 在 `.gitignore` 中，改动不会进版本库。
+- 已提交并推送：`defe4fc` `feat(0.5.2): stop dropping ASR audio, hug the caption box, add opacity slider`（`master` → `origin/master`，GPG 签名）。`.research/`、`tests/`、`paseo/`、`AGENTS.md` 在 `.gitignore` 中，这些改动不进版本库。
 - 在线直播（Twitch）只做了人眼链路，未作为转写验收源。
 - 短行合并（把 “The.” 与下一行合并再翻译）未实现，需单独设计。
 - Helium 自带拦截器会挡以标签页方式打开 `chrome-extension://<id>/popup.html`；该标签页若成为活动标签，点“开始”会报“此页面不支持标签页音频采集”。已记入 `.pit`（`tabcapture-97fd44`）。
