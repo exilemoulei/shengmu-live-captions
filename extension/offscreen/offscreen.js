@@ -2,6 +2,10 @@ const TARGET_SAMPLE_RATE = 16000;
 const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000, 30000];
 const SERVER_FINISH_TIMEOUT_MS = 10000;
 const FINAL_WRITE_TIMEOUT_MS = 5000;
+// The worker answers a transcript only after every view has taken it. Its reply
+// is not needed to send the next frame, so a worker that never answers (recycled
+// mid-message, stuck on a view) costs this long instead of ending the captions.
+const TRANSCRIPT_REPLY_TIMEOUT_MS = 5000;
 // Live packets are dropped while more than this is still queued on the
 // socket. PCM16 at 16 kHz is 32,000 bytes per second, so 64 KiB is about two
 // seconds of audio: a backlog that size already pushes captions past the
@@ -62,7 +66,9 @@ let resampleTail = 0;
 let finishWaiter = null;
 let stopPromise = null;
 let serverMessageChain = Promise.resolve();
-let backgroundWriteChain = Promise.resolve();
+// Transcript frames waiting for the worker, at most one per connection.
+let transcriptQueue = [];
+let transcriptPump = null;
 // The speech backend of this capture: { backend: "wlk", wsUrl } (the local
 // WhisperLiveKit), { backend: "bailian", url, context } or
 // { backend: "chrome", lang, phrases }. Only the last two load extra modules.
@@ -121,10 +127,42 @@ async function sendToBackground(type, payload = {}) {
   }
 }
 
-function enqueueBackgroundWrite(type, payload = {}) {
-  const task = backgroundWriteChain.then(() => sendToBackground(type, payload));
-  backgroundWriteChain = task.catch(() => {});
-  return task;
+function sendTranscript(payload) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, TRANSCRIPT_REPLY_TIMEOUT_MS);
+    void sendToBackground("transcript-update", payload).finally(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+async function pumpTranscripts() {
+  try {
+    while (transcriptQueue.length > 0) {
+      await sendTranscript(transcriptQueue.shift());
+    }
+  } finally {
+    transcriptPump = null;
+  }
+}
+
+// Every frame holds the server's whole window, so a newer frame replaces an
+// older one that has not left yet: WhisperLiveKit sends 20 a second, and queueing
+// them behind a slow worker delayed the captions without limit. A frame of an
+// earlier connection is the last that connection will ever send, so it stays.
+function queueTranscript(payload) {
+  const last = transcriptQueue.at(-1);
+  if (last?.epochId === payload.epochId) {
+    transcriptQueue[transcriptQueue.length - 1] = payload;
+  } else {
+    transcriptQueue.push(payload);
+  }
+  if (!transcriptPump) transcriptPump = pumpTranscripts();
+}
+
+function transcriptsDelivered() {
+  return transcriptPump || Promise.resolve();
 }
 
 async function waitForChain(chain, timeoutMs) {
@@ -357,16 +395,16 @@ async function handleServerMessage(event) {
     return;
   }
   if (data.type === "ready_to_stop") {
-    await waitForChain(backgroundWriteChain, 3000);
+    await waitForChain(transcriptsDelivered(), 3000);
     markServerFinished();
     await publishStatus("finished", msg("offscreen_server_finished"));
     return;
   }
 
-  await emitTranscript(data);
+  emitTranscript(data);
 }
 
-async function emitTranscript(data) {
+function emitTranscript(data) {
   const signature = JSON.stringify({
     lines: data.lines,
     bufferTranscription: data.buffer_transcription,
@@ -376,12 +414,7 @@ async function emitTranscript(data) {
   if (signature === lastDataSignature) return;
   lastDataSignature = signature;
 
-  await enqueueBackgroundWrite("transcript-update", {
-    sessionId,
-    epochId,
-    epochStartedAt,
-    data
-  });
+  queueTranscript({ sessionId, epochId, epochStartedAt, data });
 }
 
 async function handleBailianMessage(event) {
@@ -393,7 +426,7 @@ async function handleBailianMessage(event) {
     return;
   }
   if (parsed.kind === "finished") {
-    await waitForChain(backgroundWriteChain, 3000);
+    await waitForChain(transcriptsDelivered(), 3000);
     markServerFinished();
     await publishStatus("finished", msg("offscreen_bailian_finished"));
     return;
@@ -411,7 +444,7 @@ async function handleBailianMessage(event) {
   } else {
     bailianLines.interim(parsed.text);
   }
-  await emitTranscript(bailianLines.message());
+  emitTranscript(bailianLines.message());
 }
 
 function openWebSocket() {
@@ -437,7 +470,6 @@ function openWebSocket() {
     lastDataSignature = "";
     serverFinished = false;
     serverMessageChain = Promise.resolve();
-    backgroundWriteChain = Promise.resolve();
     resetPendingAudio();
     if (asrConfig?.backend === "bailian") {
       bailianStarted = false;
@@ -665,12 +697,11 @@ async function startWebSpeech(track) {
   epochId = crypto.randomUUID();
   epochStartedAt = Date.now();
   lastDataSignature = "";
-  backgroundWriteChain = Promise.resolve();
   speechSession = speech.createWebSpeechSession({
     track,
     lang: asrConfig.lang,
     phrases: asrConfig.phrases,
-    onMessage: (data) => void emitTranscript(data),
+    onMessage: (data) => emitTranscript(data),
     onFatal: (detail) => void publishStatus("error", detail, { fatal: true })
   });
   await publishStatus("capturing", msg("offscreen_using_chrome_speech"));
@@ -694,7 +725,7 @@ async function performStopCapture(options = {}) {
   if (speechSession) {
     await speechSession.stop();
     speechSession = null;
-    await waitForChain(backgroundWriteChain, FINAL_WRITE_TIMEOUT_MS);
+    await waitForChain(transcriptsDelivered(), FINAL_WRITE_TIMEOUT_MS);
   }
   if (websocket?.readyState === WebSocket.OPEN && transportReady()) {
     flushPackets(true);
@@ -711,10 +742,10 @@ async function performStopCapture(options = {}) {
     const finished = await waitForServerFinished(SERVER_FINISH_TIMEOUT_MS);
     if (finished) {
       await waitForChain(serverMessageChain, FINAL_WRITE_TIMEOUT_MS);
-      await waitForChain(backgroundWriteChain, FINAL_WRITE_TIMEOUT_MS);
+      await waitForChain(transcriptsDelivered(), FINAL_WRITE_TIMEOUT_MS);
     } else {
       await waitForChain(serverMessageChain, 1000);
-      await waitForChain(backgroundWriteChain, 1000);
+      await waitForChain(transcriptsDelivered(), 1000);
     }
   }
   if (websocket) {
@@ -744,7 +775,7 @@ async function performStopCapture(options = {}) {
   resampleTail = 0;
   finishWaiter = null;
   serverMessageChain = Promise.resolve();
-  backgroundWriteChain = Promise.resolve();
+  transcriptQueue = [];
   epochId = null;
   epochStartedAt = 0;
   asrConfig = null;

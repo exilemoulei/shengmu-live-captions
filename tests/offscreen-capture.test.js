@@ -12,7 +12,7 @@ const PACKET_SAMPLES = 1600; // 100 ms at 16 kHz: the fake context needs no resa
 const PACKET_BYTES = PACKET_SAMPLES * 2;
 const LIMIT_BYTES = 64 * 1024;
 
-function loadOffscreen() {
+function loadOffscreen({ answer = async () => {}, timerScale = 1 } = {}) {
   const messages = [];
   const sockets = [];
   let listener = null;
@@ -96,6 +96,7 @@ function loadOffscreen() {
         getURL: (path) => new URL(`../extension/${path}`, import.meta.url).href,
         sendMessage: async (message) => {
           messages.push(structuredClone(message));
+          return answer(message);
         },
         onMessage: {
           addListener: (callback) => {
@@ -112,7 +113,7 @@ function loadOffscreen() {
     crypto: globalThis.crypto,
     performance: globalThis.performance,
     console,
-    setTimeout,
+    setTimeout: (callback, ms) => setTimeout(callback, ms * timerScale),
     clearTimeout,
     setInterval,
     clearInterval
@@ -282,6 +283,101 @@ test("a failed bailian task ends the capture with a fatal, actionable error", as
   // A message: the worker renders it, since offscreen has no chrome.i18n.
   assert.match(renderZh(status.detail), /API Key 无效/);
   await offscreen.stop();
+});
+
+function frame(text) {
+  return { data: JSON.stringify({ lines: [{ speaker: 1, text, start: "0:00:00.00", end: "0:00:01.00" }] }) };
+}
+
+function transcripts(offscreen) {
+  return offscreen.messages
+    .filter((message) => message.type === "transcript-update")
+    .map((message) => message.data.lines[0].text);
+}
+
+const settle = () =>
+  new Promise((resolve) => {
+    setTimeout(resolve, 20);
+  });
+
+test("frames that arrive during a slow worker reply collapse into the newest", async (t) => {
+  const replies = [];
+  const offscreen = loadOffscreen({
+    answer: (message) =>
+      message.type === "transcript-update"
+        ? new Promise((resolve) => {
+            replies.push(resolve);
+          })
+        : undefined
+  });
+  t.after(offscreen.dispose);
+  const socket = await offscreen.start("session-1");
+
+  for (const text of ["one", "two", "three", "four"]) socket.onmessage(frame(text));
+  await settle();
+  assert.deepEqual(transcripts(offscreen), ["one"]);
+
+  replies.shift()();
+  await settle();
+  // Two and three were whole windows that "four" already contains.
+  assert.deepEqual(transcripts(offscreen), ["one", "four"]);
+});
+
+test("a worker that never answers delays the captions but does not end them", async (t) => {
+  const offscreen = loadOffscreen({
+    answer: (message) => (message.type === "transcript-update" ? new Promise(() => {}) : undefined),
+    timerScale: 0.001
+  });
+  t.after(offscreen.dispose);
+  const socket = await offscreen.start("session-1");
+
+  socket.onmessage(frame("one"));
+  await settle();
+  socket.onmessage(frame("two"));
+  await settle();
+  socket.onmessage(frame("three"));
+  await settle();
+  assert.deepEqual(transcripts(offscreen), ["one", "two", "three"]);
+});
+
+test("the last frame of a closed connection still reaches the worker", async (t) => {
+  const replies = [];
+  const offscreen = loadOffscreen({
+    answer: (message) =>
+      message.type === "transcript-update"
+        ? new Promise((resolve) => {
+            replies.push(resolve);
+          })
+        : undefined
+  });
+  t.after(offscreen.dispose);
+  const socket = await offscreen.start("session-1");
+
+  socket.onmessage(frame("first"));
+  socket.onmessage(frame("last of the old connection"));
+  await settle();
+  // A reconnect starts a new epoch while "first" is still out.
+  socket.onopen();
+  socket.onmessage(frame("new connection"));
+  await settle();
+  replies.shift()();
+  await settle();
+  replies.shift()();
+  await settle();
+
+  assert.deepEqual(transcripts(offscreen), ["first", "last of the old connection", "new connection"]);
+});
+
+test("stopping delivers the newest frame before the capture ends", async (t) => {
+  const offscreen = loadOffscreen();
+  t.after(offscreen.dispose);
+  const socket = await offscreen.start("session-1");
+
+  socket.onmessage(frame("first"));
+  socket.onmessage(frame("final words"));
+  await offscreen.stop();
+
+  assert.equal(transcripts(offscreen).at(-1), "final words");
 });
 
 test("the offscreen modules never call chrome.i18n, which offscreen documents lack", () => {
