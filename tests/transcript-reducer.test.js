@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { createCaptionDeltaEncoder } from "../extension/lib/caption-delta.js";
 import {
   RUNTIME_LINE_LIMIT,
   lineSignature,
@@ -278,4 +279,31 @@ test("runtime rows are capped to the newest window", () => {
   assert.equal(result.patch.current.lines[0].source, "Sentence number 5 is complete.");
   // Untranslated rows are screen-only until a translation lands on them.
   assert.deepEqual(result.historyLines, []);
+});
+
+test("a delta carries only the row that changed, not the whole window", () => {
+  const encoder = createCaptionDeltaEncoder();
+  const options = { knownLines: new Map(), useApi: true };
+  const message = (text, now) => ({
+    sessionId: "s",
+    epochId: "e",
+    epochStartedAt: 1000,
+    data: {
+      lines: [
+        { speaker: 1, text: "This first sentence has finished and will never change again.", start: "0:00:00.00", end: "0:00:02.00" },
+        { speaker: 1, text: "This second sentence has also finished and stays the same.", start: "0:00:10.00", end: "0:00:12.00" },
+        { speaker: 1, text, start: "0:00:20.00", end: "0:00:22.00" }
+      ]
+    },
+    now
+  });
+
+  const first = reduceTranscriptUpdate({ current: { lines: [] } }, message("The third sentence is still growing.", 2000), { ...options, now: 2000 });
+  encoder.encode(first.patch.current);
+  const second = reduceTranscriptUpdate({ current: first.patch.current }, message("The third sentence is still growing and has more words.", 3000), { ...options, now: 3000 });
+  const encoded = encoder.encode(second.patch.current);
+
+  assert.deepEqual(encoded.delta.lines.map((line) => line.source), ["The third sentence is still growing and has more words."]);
+  assert.equal(second.patch.current.lines[0].updatedAt, 2000);
+  assert.equal(second.patch.current.lines[2].updatedAt, 3000);
 });

@@ -55,6 +55,28 @@ export function linesChangedSince(lines, knownLines) {
 }
 
 /**
+ * Every update stamps every row, and WhisperLiveKit resends its whole window on
+ * every update. Left alone the stamp alone makes every row differ, so each
+ * caption delta carried the full window (66 rows and 73 KB after ten minutes)
+ * to every view and the captured page, several times a second.
+ * @param {any[]} previousLines
+ * @param {any[]} lines
+ * @returns {any[]}
+ */
+function keepUnchangedStamps(previousLines, lines) {
+  const stamps = new Map();
+  for (const line of previousLines) {
+    if (line?.id) stamps.set(line.id, line);
+  }
+  return lines.map((line) => {
+    const previous = stamps.get(line.id);
+    return previous?.updatedAt && !lineChanged(previous, line)
+      ? { ...line, updatedAt: previous.updatedAt }
+      : line;
+  });
+}
+
+/**
  * @typedef {object} TranscriptMessage
  * @property {any} data The WhisperLiveKit payload (`lines`, `buffer_transcription` ...).
  * @property {string} sessionId
@@ -96,10 +118,13 @@ export function reduceTranscriptUpdate(state, message, options) {
   // A row keeps its translation while the recogniser appends to it; the stale
   // copy stays on screen as a stage translation instead of falling back to the
   // previous sentence (see reconcileLineTranslations).
-  const lines = reconcileLineTranslations(previous.lines || [], normalized.lines, {
-    useApi,
-    knownLines
-  });
+  const lines = keepUnchangedStamps(
+    previous.lines || [],
+    reconcileLineTranslations(previous.lines || [], normalized.lines, {
+      useApi,
+      knownLines
+    })
+  );
 
   const historyLines = linesChangedSince(lines, knownLines);
 
