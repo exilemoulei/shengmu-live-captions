@@ -1,5 +1,30 @@
 # 项目进度记录 (PROGRESS.md)
 
+## 2026-11-06 · 捕获页卡住时字幕整条链路停摆
+
+现象：长时间会话中字幕会卡死。翻译请求是无状态的（上下文最多 4 行、每行 480 字符），也没有译文缓存，所以不是上下文或缓存累积。三小时虚拟时钟回放里单帧耗时、运行窗口和翻译队列都不随会话变长而增长。
+
+### 根因
+
+转写链路是串行的，且每一环都等下一环答复：offscreen 等 worker 回复，worker 在 `publishCaptions` 里等每个视图回复，而 `chrome.tabs.sendMessage` 要等捕获页主线程跑完监听器才返回。翻译 worker 也走同一条 publish 路径。链路上没有超时，也没有合并，WhisperLiveKit 每秒约 20 帧全部排队。所以捕获页主线程卡多久，字幕、翻译和历史就停多久；一次永不返回的发送会让它永久停摆。
+
+### 修复
+
+- `extension/lib/latest-sender.js`（新增）：单接收方单发、只留最新请求，调用方最多等 1.5 s，15 s 无答复则放弃并让下一条发全量。
+- `extension/background/views.js`：字幕状态经 latest-sender 发送，其余广播最多等 1.5 s。
+- `extension/offscreen/offscreen.js`：帧是整窗快照，发送中只保留每个连接最新的一帧；worker 不回复时 5 s 后继续。
+- `extension/lib/transcript-reducer.js`：内容未变的行保留 `updatedAt`。此前每帧给所有行打新时间戳，增量编码把整个窗口都算作变化。
+
+### 验证
+
+- 真实链路（headless Chrome 捕获 + WLK mlx-whisper + mock 翻译），捕获页主线程冻结 20 s：
+  - 修复前：积压 0 → 338 帧，末行停止更新，一次发送耗时 19905 ms。
+  - 修复后：积压始终为 0，字幕和翻译持续更新，最长等待 1508 ms；解冻后第一次采样浮层即追平。
+- 一小时回放（基线 upstream/master）：单条增量 23055 → 3573 字节，广播流量约 55 → 18.7 KB/s。
+- `pnpm run verify` 338 项全过；`pnpm run smoke` 全过。
+
+注意：本修复未包含超长 ASR 行切分（PR #3）。WLK 服务端自身卡住（连接仍开、不再出帧）目前仍无法检测。
+
 ## 2026-11-05 · 0.5.12 · 百炼模型封闭下拉 + DeepL 术语库
 
 两项 backlog 一起做，另加用户点名的 turbo 实测。基线 0.5.11（325 项 verify 前是 315）。
