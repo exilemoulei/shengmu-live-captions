@@ -5,6 +5,7 @@ import {
   settingsForCaptions
 } from "../lib/caption-utils.js";
 import { createCaptionDeltaEncoder } from "../lib/caption-delta.js";
+import { SENDER_WAIT_MS, createLatestSender } from "../lib/latest-sender.js";
 import { errorText, t } from "./i18n.js";
 
 export const MONITOR_URL = "subtitle/subtitle.html";
@@ -20,13 +21,19 @@ const MONITOR_BOUNDS = Object.freeze({ width: 1160, height: 760, left: 80, top: 
  * extension pages and one for the captured tab; a receiver that sees a gap
  * asks for a resync and the next message of that stream is full.
  *
+ * The transcript path and the translation workers await these sends, and a send
+ * settles only when the receiver has run its listener. Caption state therefore
+ * goes through a latest-only sender per stream, and nothing here waits on a
+ * receiver for longer than SENDER_WAIT_MS: a stuck page must not stop the
+ * captions, the history or the other views.
+ *
  * @param {{ store: any, settings: any, ready: () => Promise<void> }} deps
  */
 export function createViews({ store, settings, ready }) {
   const extensionCaptions = createCaptionDeltaEncoder();
   const tabCaptions = createCaptionDeltaEncoder();
 
-  async function broadcastToExtension(message) {
+  async function postToExtension(message) {
     try {
       await chrome.runtime.sendMessage({
         target: "extension-view",
@@ -39,35 +46,67 @@ export function createViews({ store, settings, ready }) {
     }
   }
 
-  async function sendToTab(message) {
-    if (!store.state.tabId) return false;
-    try {
-      await chrome.tabs.sendMessage(store.state.tabId, {
-        target: "content",
-        ...message
+  const extensionCaptionSender = createLatestSender({
+    send: postToExtension,
+    onAbandon: () => extensionCaptions.reset()
+  });
+
+  /** Waits for the receiver, but never for longer than the sender would. */
+  function bounded(promise) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, SENDER_WAIT_MS);
+      void promise.then(() => {
+        clearTimeout(timer);
+        resolve();
       });
-      return true;
+    });
+  }
+
+  async function broadcastToExtension(message) {
+    if (message.type === "caption-state") {
+      await extensionCaptionSender.request(message);
+      return;
+    }
+    await bounded(postToExtension(message));
+  }
+
+  async function postToTab(message) {
+    try {
+      await chrome.tabs.sendMessage(store.state.tabId, { target: "content", ...message });
     } catch {
-      return false;
+      // The page has no listener (navigating, restricted).
     }
   }
 
-  async function broadcastCaptionState() {
-    const state = store.state;
-    await sendToTab({
-      type: "caption-state",
-      payload: {
-        active: state.active,
-        status: state.status,
-        detail: state.detail,
-        lineCount: state.lineCount,
-        wsConnected: state.wsConnected,
-        updatedAt: state.updatedAt,
-        overlayError: state.overlayError || "",
-        caption: tabCaptions.encode(state.current)
-      },
-      settings: settingsForCaptions(settings.current)
-    });
+  const tabCaptionSender = createLatestSender({
+    send: () => {
+      const state = store.state;
+      if (!state.tabId) return;
+      return postToTab({
+        type: "caption-state",
+        payload: {
+          active: state.active,
+          status: state.status,
+          detail: state.detail,
+          lineCount: state.lineCount,
+          wsConnected: state.wsConnected,
+          updatedAt: state.updatedAt,
+          overlayError: state.overlayError || "",
+          caption: tabCaptions.encode(state.current)
+        },
+        settings: settingsForCaptions(settings.current)
+      });
+    },
+    onAbandon: () => tabCaptions.reset()
+  });
+
+  async function sendToTab(message) {
+    if (!store.state.tabId) return;
+    await bounded(postToTab(message));
+  }
+
+  function broadcastCaptionState() {
+    return tabCaptionSender.request(undefined);
   }
 
   async function updateBadge() {
@@ -113,6 +152,7 @@ export function createViews({ store, settings, ready }) {
       // sendMessage rejection is the only signal the worker ever gets, so
       // treat it as an injection failure instead of swallowing it.
       // A fresh overlay holds nothing, so its stream restarts with a full message.
+      tabCaptionSender.forget();
       tabCaptions.reset();
       const response = await chrome.tabs.sendMessage(tabId, {
         target: "content",
@@ -213,6 +253,8 @@ export function createViews({ store, settings, ready }) {
       return true;
     }
     if (!sender?.tab?.id || sender.tab.id !== store.state.tabId) return false;
+    // The tab is answering again, so whatever send was out is not worth waiting for.
+    tabCaptionSender.forget();
     tabCaptions.reset();
     await broadcastCaptionState();
     return true;

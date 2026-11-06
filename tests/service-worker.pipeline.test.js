@@ -345,3 +345,27 @@ test("the bailian backend needs its key, adds the handshake header and removes i
   assert.equal(mock.sessionRules.size, 0);
   await configureApi({ asrBackend: "wlk" });
 });
+
+test("a captured page that stops answering does not stop the captions", async () => {
+  await configureApi();
+  const sessionId = await startSession();
+  const previousHook = mock.hooks.tabMessage;
+  mock.hooks.tabMessage = () => new Promise(() => {});
+  try {
+    const started = Date.now();
+    await sendTranscript(sessionId, [{ speaker: 1, text: "The first sentence has finished and stays as it is.", start: "0:00:00.00", end: "0:00:01.00" }]);
+    await sendTranscript(sessionId, [
+      { speaker: 1, text: "The first sentence has finished and stays as it is.", start: "0:00:00.00", end: "0:00:01.00" },
+      { speaker: 1, text: "The second sentence arrived while the page was stuck.", start: "0:00:10.00", end: "0:00:11.00" }
+    ]);
+    // The first send waits out the bound once; after that nothing waits on the page.
+    assert.ok(Date.now() - started < 4000);
+    const state = await getState();
+    assert.equal(state.current.lines.length, 2);
+    // Translation and history carry on behind the stuck page.
+    await waitFor(async () => (await getHistoryLines(sessionId)).length === 2);
+  } finally {
+    mock.hooks.tabMessage = previousHook;
+  }
+  await mock.sendToBackground({ target: "background", type: "stop-capture" });
+});
